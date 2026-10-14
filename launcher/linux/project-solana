@@ -26,7 +26,7 @@ OTHER = {"SCUS_971.99": "Ratchet & Clank (NTSC-U)", "SCPS_150.37": "Ratchet & Cl
          "SCUS_973.53": "Ratchet & Clank: Up Your Arsenal (NTSC-U)", "SCES_524.56": "Ratchet & Clank 3 (PAL)",
          "SCUS_974.65": "Ratchet: Deadlocked (NTSC-U)", "SCES_532.85": "Ratchet: Gladiator (PAL)"}
 
-VERSION = "1.1"
+VERSION = "1.2"
 HOME = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "project-solana")
 INI = os.path.join(HOME, "solana.ini")
 LAUNCHER_LOG = os.path.join(HOME, "launcher_log.txt")
@@ -192,6 +192,27 @@ def check_libs(quiet=False):
 
 
 # ---- build ----
+OPEN_FILES_NEEDED = 16384   # the link opens every object file at once (about 5,700 for all levels)
+
+
+def raise_open_files():
+    """Linux allows 1,024 open files per program by default (the soft limit); a program may raise
+    its own up to the hard limit (usually 524,288) without root. The build inherits it."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard == resource.RLIM_INFINITY else min(hard, max(soft, 1 << 20))
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        soft2 = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        log("open files limit: %s (was %s, hard %s)" % (soft2, soft, hard))
+        if soft2 != resource.RLIM_INFINITY and soft2 < OPEN_FILES_NEEDED:
+            say("Warning: this system lets a program open only %d files at once; linking the game needs about %d." % (soft2, OPEN_FILES_NEEDED))
+            say("If the build stops at linking, raise the limit (for example DefaultLimitNOFILE=524288 in /etc/systemd/system.conf, then log in again).")
+    except (ImportError, ValueError, OSError) as e:
+        log("open files limit: could not raise it (%s)" % e)
+
+
 def progress_line(line):
     p = line.split()
     if len(p) >= 4 and p[0] == "[progress]":
@@ -258,6 +279,7 @@ def build(args):
     py = os.path.join(tc_dir, "python", "bin", "python3")
     cmd = [py, "-u", "build.py", "--platform", "linux", "--levels", levels, "--iso", iso, "--repo", "decomp", "-j", str(jobs)]
     log = open(os.path.join(gdir, "build_log.txt"), "w")
+    raise_open_files()
     p = subprocess.Popen(cmd, cwd=gdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     for line in p.stdout:
         log.write(line)

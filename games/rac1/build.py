@@ -207,6 +207,13 @@ def cc(job):
     r = subprocess.run(zig + ["cc"] + common + extra + ["-c", src, "-o", o], capture_output=True, text=True)
     return o, (r.stderr if r.returncode else None)
 
+try:   # Linux: the link opens every object at once (~5,700); the default soft limit is often 1,024
+    import resource
+    _s, _h = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if _s != resource.RLIM_INFINITY and (_h == resource.RLIM_INFINITY or _s < _h):
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_h if _h != resource.RLIM_INFINITY else 1 << 20, _h))
+except (ImportError, ValueError, OSError):
+    pass
 progress("compile", 0, len(jobs))
 with ThreadPoolExecutor(a.j) as ex:
     futs = [ex.submit(cc, j) for j in jobs]
