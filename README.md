@@ -23,7 +23,7 @@ The game runs natively on Linux (no Wine or Proton). The Linux launcher is a sin
 ./project-solana desktop                     # adds it to the applications menu; from there, Steam > Add a Non-Steam Game
 ```
 
-It needs `python3` and the **32-bit** SDL2 and OpenGL libraries. Steam installs them, so SteamOS and any PC with Steam already has them; otherwise `./project-solana status` says what to install for your distribution. Everything is kept in `~/.local/share/project-solana`. On a Steam Deck, run the build once in Desktop Mode (Konsole), then add the game to Steam with `desktop`; it starts full screen there, with the Deck's controls as the controller.
+It needs `python3` and the **32-bit** SDL2 and OpenGL libraries. On SteamOS (Steam Deck, Steam Machine) nothing needs installing: the launcher uses the copy of SDL2 that comes with Steam. Elsewhere, `./project-solana status` says what to install for your distribution. Everything is kept in `~/.local/share/project-solana`. On a Steam Deck, run the build once in Desktop Mode (Konsole), then add the game to Steam with `desktop`; it starts full screen there (and on any SteamOS device), with the Deck's controls as the controller.
 
 ### Supported games
 
@@ -89,3 +89,7 @@ gh release create rac1 dist/rac1/rac1.json dist/rac1/rac1-build.zip dist/rac1/to
 To update an existing game release, upload the new files over the old ones (`gh release upload rac1 dist/rac1/* --clobber`). Players get them with **Rebuild the game**.
 
 The launchers go in a release of their own (for example `launcher-v1`): `Project Solana.exe` and `project-solana` (Linux).
+
+## Licence
+
+TODO (maintainers): choose a licence for this repository. Third-party code keeps its own (see `THIRD_PARTY_NOTICES.md`).

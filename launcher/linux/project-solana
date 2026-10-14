@@ -26,7 +26,7 @@ OTHER = {"SCUS_971.99": "Ratchet & Clank (NTSC-U)", "SCPS_150.37": "Ratchet & Cl
          "SCUS_973.53": "Ratchet & Clank: Up Your Arsenal (NTSC-U)", "SCES_524.56": "Ratchet & Clank 3 (PAL)",
          "SCUS_974.65": "Ratchet: Deadlocked (NTSC-U)", "SCES_532.85": "Ratchet: Gladiator (PAL)"}
 
-VERSION = "1.2"
+VERSION = "1.4"
 HOME = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "project-solana")
 INI = os.path.join(HOME, "solana.ini")
 LAUNCHER_LOG = os.path.join(HOME, "launcher_log.txt")
@@ -161,34 +161,113 @@ def rmtree(p):
 
 
 # ---- the 32-bit libraries the game loads ----
-LIBDIRS = ["/usr/lib32", "/usr/lib/i386-linux-gnu", "/lib/i386-linux-gnu", "/usr/lib/i686-linux-gnu", "/lib32"]
+# Distributions keep 32-bit libraries in different places (Debian: /usr/lib/i386-linux-gnu, Arch and
+# SteamOS: /usr/lib32, Fedora: /usr/lib, where Arch keeps its 64-bit ones), so a file is only counted
+# when it really is 32-bit x86. SteamOS has no 32-bit SDL2 of its own (and its system is read-only),
+# but Steam carries one in its runtime: that copy is used when the system has none.
+SYS_DIRS = ["/usr/lib32", "/usr/lib/i386-linux-gnu", "/lib/i386-linux-gnu", "/usr/lib/i686-linux-gnu", "/lib32", "/usr/lib", "/lib",
+            "/usr/local/lib32", "/usr/local/lib"]
+STEAM_ROOTS = ["~/.local/share/Steam", "~/.steam/steam", "~/.steam/root", "~/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+               "~/.var/app/com.valvesoftware.Steam/data/Steam", "~/snap/steam/common/.local/share/Steam"]
+STEAM_SUBDIRS = ["ubuntu12_32/steam-runtime/usr/lib/i386-linux-gnu", "ubuntu12_32/steam-runtime/lib/i386-linux-gnu",
+                 "ubuntu12_32/steam-runtime/pinned_libs_32", "ubuntu12_32/steam-runtime/i386/usr/lib/i386-linux-gnu",
+                 "ubuntu12_32/steam-runtime/i386/lib/i386-linux-gnu",
+                 # the runtime Steam installs as a tool ("Steam Linux Runtime 1.0 (scout)")
+                 "steamapps/common/SteamLinuxRuntime/steam-runtime/usr/lib/i386-linux-gnu",
+                 "steamapps/common/SteamLinuxRuntime/steam-runtime/lib/i386-linux-gnu",
+                 "steamapps/common/SteamLinuxRuntime/steam-runtime/pinned_libs_32"]
+SDL = "libSDL2-2.0.so.0"
 
 
-def have_lib(name):
-    if any(os.path.exists(os.path.join(d, name)) for d in LIBDIRS): return True
-    try:   # (Fedora and others keep 32-bit libraries in /usr/lib: ask the linker cache)
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
-        return any(name in l and "x86-64" not in l and "64bit" not in l for l in out.splitlines())
+def elf32(path):
+    """a 32-bit x86 ELF file (symlinks followed)"""
+    try:
+        with open(path, "rb") as f: h = f.read(20)
+        return h[:4] == b"\x7fELF" and h[4] == 1 and struct.unpack_from("<H", h, 18)[0] == 3
     except OSError:
         return False
 
 
-def lib_paths(name):
-    return [os.path.join(d, name) for d in LIBDIRS + ["/lib", "/usr/lib"] if os.path.exists(os.path.join(d, name))]
+def ldconfig_paths(name):
+    exe = shutil.which("ldconfig") or next((p for p in ("/sbin/ldconfig", "/usr/sbin/ldconfig") if os.path.exists(p)), None)
+    if not exe: return []
+    try: out = subprocess.run([exe, "-p"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError): return []
+    return [l.split("=>", 1)[1].strip() for l in out.splitlines() if l.strip().startswith(name + " ") and "=>" in l]
+
+
+def lib_candidates(name):
+    seen, out = set(), []
+    for p in [os.path.join(d, name) for d in SYS_DIRS] + ldconfig_paths(name):
+        r = os.path.realpath(p)
+        if os.path.exists(p) and r not in seen: seen.add(r); out.append(p)
+    return out
+
+
+def find32(name):
+    return next((p for p in lib_candidates(name) if elf32(p)), None)
+
+
+def steam_sdl():
+    """Steam's own 32-bit SDL2 (its runtime), if Steam is installed and has run once"""
+    for root in STEAM_ROOTS:
+        for sub in STEAM_SUBDIRS:
+            p = os.path.join(os.path.expanduser(root), sub, SDL)
+            if elf32(p): return p
+    for root in STEAM_ROOTS:   # (another runtime layout: look for it)
+        tops = [os.path.join(os.path.expanduser(root), "ubuntu12_32")]
+        common = os.path.join(os.path.expanduser(root), "steamapps", "common")
+        if os.path.isdir(common): tops += [os.path.join(common, d) for d in sorted(os.listdir(common)) if d.startswith("SteamLinuxRuntime")]
+        for top in tops:
+            for d, dirs, files in os.walk(top):
+                if SDL in files and elf32(os.path.join(d, SDL)): return os.path.join(d, SDL)
+                if d.count(os.sep) - top.count(os.sep) > 5: dirs[:] = []
+    return None
+
+
+def find_sdl():
+    """(path, from Steam) of a 32-bit SDL2, or (None, False)"""
+    p = find32(SDL)
+    if p: return p, False
+    p = steam_sdl()
+    return (p, True) if p else (None, False)
 
 
 def check_libs(quiet=False):
-    missing = [n for n in ("libSDL2-2.0.so.0", "libGL.so.1") if not have_lib(n)]
-    if not lib_paths("ld-linux.so.2"): missing.insert(0, "the 32-bit C library (ld-linux.so.2)")
+    missing = []
+    if not find32("ld-linux.so.2"): missing.append("the 32-bit C library (ld-linux.so.2)")
+    if not find_sdl()[0]: missing.append(SDL)
+    if not find32("libGL.so.1"): missing.append("libGL.so.1")
     if missing and not quiet:
         say("\nThe game is a 32-bit program and needs these 32-bit libraries: %s" % ", ".join(missing))
-        say("Installing Steam brings them. Otherwise:")
+        if missing == [SDL]:
+            say("If Steam is installed, start it once: the game can use the copy of SDL2 that comes with Steam.")
+        say("To install them:")
         say("  Debian, Ubuntu, Mint, Pop!_OS:  sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install libc6:i386 libsdl2-2.0-0:i386 libgl1:i386 libgl1-mesa-dri:i386")
-        say("  Fedora:                          sudo dnf install glibc.i686 SDL2.i686 mesa-libGL.i686 mesa-dri-drivers.i686")
+        say("  Fedora, Nobara, Bazzite:        sudo dnf install glibc.i686 SDL2.i686 mesa-libGL.i686 mesa-dri-drivers.i686")
         say("  Arch, Manjaro, EndeavourOS:      enable [multilib], then sudo pacman -S lib32-glibc lib32-sdl2 lib32-mesa")
         say("  openSUSE:                        sudo zypper install glibc-32bit libSDL2-2_0-0-32bit Mesa-libGL1-32bit")
         say("  (NVIDIA's own driver: also its 32-bit OpenGL library, e.g. lib32-nvidia-utils on Arch)")
     return not missing
+
+
+def is_steamos():
+    try: return any(l.strip() in ("ID=steamos", 'ID="steamos"') for l in open("/etc/os-release"))
+    except OSError: return False
+
+
+def sdl_env(env):
+    """when the SDL2 is Steam's: a folder holding only a link to it goes first on the library path
+    (not Steam's whole runtime: its other libraries would replace the system's)"""
+    p, steam = find_sdl()
+    if not steam: return
+    d = os.path.join(HOME, "lib32")
+    os.makedirs(d, exist_ok=True)
+    link = os.path.join(d, SDL)
+    if os.path.islink(link) or os.path.exists(link): os.remove(link)
+    os.symlink(p, link)
+    env["LD_LIBRARY_PATH"] = d + (os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    log("using Steam's SDL2: %s" % p)
 
 
 # ---- build ----
@@ -304,7 +383,7 @@ def play(args):
         if v is not None: pc[k] = str(v)
     save(c)
     env = dict(os.environ)
-    deck = os.environ.get("SteamDeck") == "1"
+    deck = os.environ.get("SteamDeck") == "1" or is_steamos()   # (Steam Deck, Steam Machine: full screen by default)
     if pc.get("resolution", "upscaled") == "upscaled":
         try:   # (as the Windows launcher: render at about the screen's height)
             out = subprocess.run(["xrandr", "--current"], capture_output=True, text=True, timeout=5).stdout
@@ -316,6 +395,7 @@ def play(args):
     if full: env["UYA_FULLSCREEN"] = "1"
     if pc.get("vsync", "0") in ("1", "True", "true"): env["UYA_VSYNC"] = "1"
     if not check_libs(quiet=True): check_libs(); die("install the 32-bit libraries above, then play again")
+    sdl_env(env)
     gdir = os.path.dirname(exe)
     out = os.path.join(gdir, "game_output.txt")   # what SDL, the graphics driver and the game print (kept: one run back)
     if os.path.exists(out): os.replace(out, out + ".prev")
@@ -401,8 +481,11 @@ def report(args):
                 w("-- %s\n%s" % (" ".join(cmd), r))
             except Exception: pass
     w("\n== 32-bit libraries\n")
-    for n in ("ld-linux.so.2", "libSDL2-2.0.so.0", "libGL.so.1"):
-        w("%s: %s\n" % (n, ", ".join(lib_paths(n)) or ("found by ldconfig" if have_lib(n) else "MISSING")))
+    for n in ("ld-linux.so.2", SDL, "libGL.so.1"):
+        found = lib_candidates(n)
+        w("%s: %s\n" % (n, ", ".join("%s (%s)" % (p, "32-bit" if elf32(p) else "not 32-bit") for p in found) or "none"))
+    sp, steam = find_sdl()
+    w("SDL2 the game uses: %s\n" % ((sp + (" (Steam's runtime)" if steam else "")) if sp else "MISSING"))
     w("\n== Project Solana\ndata folder: %s\n" % HOME)
     tv = os.path.join(HOME, "toolchain", "version.txt")
     w("build tools: %s\n" % (open(tv).read().strip() if os.path.exists(tv) else "not downloaded"))
