@@ -6,3 +6,4 @@ games/*/zig-cache/
 games/*/build_log.txt
 __pycache__/
 *.pyc
+release/rac1/
