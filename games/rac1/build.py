@@ -241,7 +241,7 @@ if a.platform == "linux":
 else:
     # the menu and runtime as a DLL at 0x40000000, plus the small launcher that owns PS2 RAM
     dll = os.path.join(out, "rac1_game.dll")
-    link = zig + ["cc", "-shared", "-target", target, "-o", dll, objs_rsp("link")] + ["-Wl,--image-base=0x40000000", "-Wl,--no-dynamicbase", "-lshell32", "-lwinmm", "-lgdi32", "-luser32"]
+    link = zig + ["cc", "-shared", "-target", target, "-o", dll, objs_rsp("link")] + ["-Wl,--image-base=0x40000000", "-Wl,--no-dynamicbase", "-lshell32", "-lwinmm", "-lgdi32", "-luser32", "-ladvapi32"]
     r = subprocess.run(link, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr[-6000:]); sys.exit("link failed (dll)")

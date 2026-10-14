@@ -48,6 +48,8 @@ Resolution (Native, or Upscaled to a whole multiple of the PS2's 448 lines that 
 ### Reporting problems
 
 - **Open log** shows `rac1_log.txt` (or the build's `build_log.txt` when a build failed).
+- On Linux, `project-solana report` writes one file with everything a report needs (system details, the 32-bit library check, the launcher, build and game logs, and the previous run's game log); attach that file.
+- A crash writes the function it happened in and the call chain into the game log, and the previous run's log is kept as `rac1_log.prev.txt`.
 - **F9** in the game records the next few seconds of graphics input to `gsrec_NN.bin` (about 260 MB per second of capture); attach it to a report together with what looked wrong.
 
 ## Repository layout
@@ -87,3 +89,7 @@ gh release create rac1 dist/rac1/rac1.json dist/rac1/rac1-build.zip dist/rac1/to
 To update an existing game release, upload the new files over the old ones (`gh release upload rac1 dist/rac1/* --clobber`). Players get them with **Rebuild the game**.
 
 The launchers go in a release of their own (for example `launcher-v1`): `Project Solana.exe` and `project-solana` (Linux).
+
+## Licence
+
+TODO (maintainers): choose a licence for this repository. Third-party code keeps its own (see `THIRD_PARTY_NOTICES.md`).

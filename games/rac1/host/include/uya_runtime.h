@@ -23,6 +23,7 @@ extern const int uya_tramp_count;
 /* platform layer */
 int  plat_map_fixed(uint32_t addr, uint32_t size, int exec);  /* 0 on success */
 int  plat_install_trap_handler(void);                         /* calls into unmapped PS2 code */
+void plat_log_system(void);                                   /* the system, for bug reports (once, at start) */
 void plat_flush_icache(void *p, size_t n);
 const char *plat_exe_dir(void);                                /* folder of the running program */
 void plat_at_exit(void);

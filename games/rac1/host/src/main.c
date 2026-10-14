@@ -63,6 +63,7 @@ int uya_main(int argc, char **argv)
     uya_log_open();
     uya_log("Project Solana: starting");
     plat_install_trap_handler();   /* first: a crash from here on is logged */
+    plat_log_system();
     {   /* renderer=gl|soft in the cfg (UYA_RENDERER overrides it) */
         extern const char *uya_renderer_cfg;
         const char *r = cfg_value("renderer");

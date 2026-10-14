@@ -180,9 +180,35 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+#include <signal.h>
+/* abort() (a library giving up) ends the process without an exception: raise one, so the
+ * crash handler reports it with the call chain */
+static void on_abort(int sig)
+{
+    (void)sig;
+    uya_log("crash: abort() was called");
+    RaiseException(0xE0000ABE, EXCEPTION_NONCONTINUABLE, 0, 0);
+}
 int plat_install_trap_handler(void)
 {
+    signal(SIGABRT, on_abort);
     return AddVectoredExceptionHandler(1, on_exception) ? 0 : -1;
+}
+
+void plat_log_system(void)
+{
+    typedef struct { ULONG size, major, minor, build, platform; WCHAR sp[128]; } osv_t;
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    LONG (WINAPI *rtl_ver)(osv_t *) = nt ? (void *)GetProcAddress(nt, "RtlGetVersion") : 0;
+    const char *(*wine_ver)(void) = nt ? (void *)GetProcAddress(nt, "wine_get_version") : 0;
+    osv_t v; memset(&v, 0, sizeof v); v.size = sizeof v;
+    if (rtl_ver) rtl_ver(&v);
+    SYSTEM_INFO si; GetNativeSystemInfo(&si);
+    MEMORYSTATUSEX ms; memset(&ms, 0, sizeof ms); ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
+    char cpu[128] = "?"; DWORD cl = sizeof cpu;
+    RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", RRF_RT_REG_SZ, 0, cpu, &cl);
+    uya_log("system: Windows %lu.%lu build %lu%s%s, %s, %lu cores, %llu MB RAM", v.major, v.minor, v.build,
+            wine_ver ? ", Wine " : "", wine_ver ? wine_ver() : "", cpu, si.dwNumberOfProcessors, (unsigned long long)(ms.ullTotalPhys >> 20));
 }
 
 uint64_t plat_time_us(void)

@@ -109,6 +109,11 @@ void uya_log_open(void)
 {
     char p[1024];
     snprintf(p, sizeof p, "%s/rac1_log.txt", plat_exe_dir());
+    {   /* the previous run's log is kept as rac1_log.prev.txt (a retry after a crash keeps the crash) */
+        char q[1100];
+        snprintf(q, sizeof q, "%s/rac1_log.prev.txt", plat_exe_dir());
+        remove(q); rename(p, q);
+    }
     logfile = fopen(p, "w");
     if (logfile) fprintf(stderr, "[uya] log file: %s\n", p);
 }

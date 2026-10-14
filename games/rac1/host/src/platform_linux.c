@@ -180,7 +180,29 @@ int plat_install_trap_handler(void)
     sigaction(SIGBUS, &sa, 0);
     sigaction(SIGILL, &sa, 0);
     sigaction(SIGFPE, &sa, 0);
+    sigaction(SIGABRT, &sa, 0);   /* (a library giving up: assert, abort) */
     return 0;
+}
+
+#include <sys/utsname.h>
+void plat_log_system(void)
+{
+    struct utsname u;
+    char os[160] = "unknown", line[256], cpu[160] = "?";
+    FILE *f = fopen("/etc/os-release", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "PRETTY_NAME=", 12)) { char *v = line + 12; if (*v == '"') v++; v[strcspn(v, "\"\n")] = 0; snprintf(os, sizeof os, "%s", v); }
+    if (f) fclose(f);
+    f = fopen("/proc/cpuinfo", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "model name", 10)) { char *v = strchr(line, ':'); if (v) { v += 2; v[strcspn(v, "\n")] = 0; snprintf(cpu, sizeof cpu, "%s", v); break; } }
+    if (f) fclose(f);
+    if (uname(&u) == 0) uya_log("system: Linux %s (%s), %s", u.release, u.machine, os);
+    uya_log("system: %s, %ld cores, %ld MB RAM", cpu, sysconf(_SC_NPROCESSORS_ONLN), (long)((long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) >> 20));
+    const char *st = getenv("XDG_SESSION_TYPE"), *de = getenv("XDG_CURRENT_DESKTOP");
+    uya_log("system: session %s%s%s, DISPLAY %s, WAYLAND_DISPLAY %s%s", st ? st : "?", de ? ", desktop " : "", de ? de : "",
+            getenv("DISPLAY") ? getenv("DISPLAY") : "-", getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "-",
+            getenv("SteamDeck") && !strcmp(getenv("SteamDeck"), "1") ? ", Steam Deck" : getenv("SteamAppId") ? ", started by Steam" : "");
 }
 #endif
 

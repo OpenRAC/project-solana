@@ -83,6 +83,9 @@ static struct {
     int (*QueueAudio)(SDL_AudioDeviceID, const void *, uint32_t);
     uint32_t (*GetQueuedAudioSize)(SDL_AudioDeviceID);
     void (*ClearQueuedAudio)(SDL_AudioDeviceID);
+    void (*GetVersion)(uint8_t v[3]);
+    const char *(*GetCurrentVideoDriver)(void);
+    const char *(*GetCurrentAudioDriver)(void);
 } sdl;
 
 /* 1: SDL is there and a display is (the game draws in a window); 0: headless */
@@ -105,7 +108,7 @@ static int sdl_on(void)
         "SDL_NumJoysticks", "SDL_IsGameController", "SDL_GameControllerOpen", "SDL_GameControllerClose",
         "SDL_GameControllerGetAttached", "SDL_GameControllerName", "SDL_GameControllerGetButton", "SDL_GameControllerGetAxis",
         "SDL_OpenAudioDevice", "SDL_CloseAudioDevice", "SDL_PauseAudioDevice", "SDL_QueueAudio", "SDL_GetQueuedAudioSize",
-        "SDL_ClearQueuedAudio",
+        "SDL_ClearQueuedAudio", "SDL_GetVersion", "SDL_GetCurrentVideoDriver", "SDL_GetCurrentAudioDriver",
     };
     void **fp = (void **)&sdl;
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
@@ -115,6 +118,12 @@ static int sdl_on(void)
     if (sdl.Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) != 0 && sdl.Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         uya_log("SDL2: cannot start (%s)", sdl.GetError());
         return 0;
+    }
+    {
+        uint8_t v[3] = {0, 0, 0};
+        const char *vd = sdl.GetCurrentVideoDriver(), *ad = sdl.GetCurrentAudioDriver();
+        sdl.GetVersion(v);
+        uya_log("SDL %d.%d.%d: video %s, audio %s", v[0], v[1], v[2], vd ? vd : "none", ad ? ad : "none");
     }
     sdl_state = 1;
     return 1;
