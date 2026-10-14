@@ -61,6 +61,8 @@ int uya_main(int argc, char **argv)
     setvbuf(stdout, 0, _IONBF, 0);
     atexit(plat_at_exit);
     uya_log_open();
+    uya_log("Project Solana: starting");
+    plat_install_trap_handler();   /* first: a crash from here on is logged */
     {   /* renderer=gl|soft in the cfg (UYA_RENDERER overrides it) */
         extern const char *uya_renderer_cfg;
         const char *r = cfg_value("renderer");
@@ -75,7 +77,6 @@ int uya_main(int argc, char **argv)
         uya_log("the PS2 address space could not be mapped");
         return 1;
     }
-    plat_install_trap_handler();
     {
         const char *iso = find_iso(argc, argv);
         if (!iso || uya_disc_open(iso) != 0) { uya_log("the disc image could not be opened"); return 1; }

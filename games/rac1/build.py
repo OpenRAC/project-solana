@@ -239,7 +239,14 @@ else:
     r = subprocess.run(link, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr[-6000:]); sys.exit("link failed (dll)")
-    exe = os.path.join(out, "rac1_wrapper.exe")
+    # the function names for crash reports (the .pdb is deleted after a launcher build)
+    try:
+        sys.path.insert(0, os.path.join(HERE, "tools"))
+        import pdb_syms
+        print("symbols:", pdb_syms.write_sym(dll, os.path.join(out, "rac1_game.pdb"), os.path.join(out, "rac1_game.sym")))
+    except Exception as e:
+        print("no symbol map (%s): crash reports will show offsets only" % e)
+    exe =os.path.join(out, "rac1_wrapper.exe")
     L = os.path.join(HERE, "launcher")
     link = zig + ["cc", "-target", target, "-O2", "-nostdlib", "-o", exe, os.path.join(L, "launcher_win32.c"),
                   os.path.join(L, "ps2ram_win32.c"), "-lkernel32", "-luser32",

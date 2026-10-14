@@ -13,19 +13,51 @@
 
 extern int plat_gl_active;   /* the GS presents with OpenGL (below) */
 
+/* Something other than the game holds a PS2 address: say what, and stop (taking the memory
+ * over would break whatever owns it: once it was this DLL's own code, relocated there). */
+static int map_conflict(uint32_t addr, uint32_t size, uint32_t at, const MEMORY_BASIC_INFORMATION *mi)
+{
+    char who[MAX_PATH] = "memory of another program loaded into the game (an overlay or similar)", msg[1024];
+    if (mi && mi->Type == MEM_IMAGE && GetModuleFileNameA((HMODULE)mi->AllocationBase, who, sizeof who)) {}
+    uya_log("cannot map PS2 memory 0x%08X+0x%X: 0x%08X is in use by %s", addr, size, at, who);
+    snprintf(msg, sizeof msg, "The game needs the memory at 0x%08X for the PS2, but it is in use by:\n\n%s\n\n"
+             "If this is a program injected into games (an overlay, recorder or RGB tool), close it or exclude "
+             "rac1_wrapper.exe from it, then try again.", at, who);
+    MessageBoxA(0, msg, "Project Solana", MB_ICONERROR);
+    return -1;
+}
+
 int plat_map_fixed(uint32_t addr, uint32_t size, int exec)
 {
     DWORD prot = exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
-    void *p = VirtualAlloc((void *)(uintptr_t)addr, size, MEM_RESERVE | MEM_COMMIT, prot);
-    if (p == (void *)(uintptr_t)addr) return 0;
-    /* already there? (PS2 RAM comes from the launcher's image section) */
-    MEMORY_BASIC_INFORMATION mi;
-    uint32_t a = addr;
-    while (a < addr + size) {
-        if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi) || mi.State != MEM_COMMIT) {
-            uya_log("cannot map 0x%08X+0x%X (0x%08X is in use)", addr, size, a);
+    static int said;
+    if (!said++) {   /* (normally 0x40000000; elsewhere when Windows relocated it) */
+        MEMORY_BASIC_INFORMATION me;
+        if (VirtualQuery((void *)plat_map_fixed, &me, sizeof me)) uya_log("rac1_game.dll loaded at %p", me.AllocationBase);
+        if ((uintptr_t)me.AllocationBase < 0x40000000u) {   /* (rac1_wrapper.exe keeps it above: see launcher_win32.c) */
+            char msg[512];
+            snprintf(msg, sizeof msg, "rac1_game.dll was loaded at 0x%08X, but the game needs it at 0x40000000 or above "
+                     "(lower addresses belong to the PS2). Please report this, with rac1_log.txt.", (unsigned)(uintptr_t)me.AllocationBase);
+            uya_log("%s", msg);
+            MessageBoxA(0, msg, "Project Solana", MB_ICONERROR);
             return -1;
         }
+    }
+    MEMORY_BASIC_INFORMATION mi;
+    void *p = 0;
+    if (VirtualQuery((void *)(uintptr_t)addr, &mi, sizeof mi)) {
+        if (mi.State == MEM_RESERVE && mi.AllocationBase == (void *)(uintptr_t)addr && mi.RegionSize >= size)
+            p = VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, prot);   /* rac1_wrapper.exe reserved it before loading this DLL */
+        else if (mi.State == MEM_FREE)
+            p = VirtualAlloc((void *)(uintptr_t)addr, size, MEM_RESERVE | MEM_COMMIT, prot);
+    }
+    if (p == (void *)(uintptr_t)addr) return 0;
+    /* already there: only PS2 RAM, which is the wrapper's own image section (.ps2ram) */
+    HMODULE self = GetModuleHandleA(0);
+    uint32_t a = addr;
+    while (a < addr + size) {
+        if (!VirtualQuery((void *)(uintptr_t)a, &mi, sizeof mi)) return map_conflict(addr, size, a, 0);
+        if (mi.State != MEM_COMMIT || mi.AllocationBase != (void *)self) return map_conflict(addr, size, a, &mi);
         DWORD old;
         VirtualProtect(mi.BaseAddress, mi.RegionSize, prot, &old);
         a = (uint32_t)(uintptr_t)mi.BaseAddress + (uint32_t)mi.RegionSize;
@@ -60,6 +92,38 @@ void plat_at_exit(void)
     }
 }
 
+/* the function at rva in rac1_game.sym (written by build.py: "RVA name" per line, sorted),
+ * read with Win32 calls only: the C library may be what crashed */
+static int sym_lookup(uint32_t rva, char *name, int cap, uint32_t *start)
+{
+    char p[MAX_PATH + 32];
+    DWORD n = GetModuleFileNameA(0, p, MAX_PATH);
+    while (n && p[n - 1] != '\\') n--;
+    lstrcpyA(p + n, "rac1_game.sym");
+    HANDLE f = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    DWORD sz = GetFileSize(f, 0), got = 0;
+    char *b = sz && sz < (64u << 20) ? VirtualAlloc(0, sz + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : 0;
+    int ok = b && ReadFile(f, b, sz, &got, 0) && got == sz;
+    CloseHandle(f);
+    if (!ok) { if (b) VirtualFree(b, 0, MEM_RELEASE); return 0; }
+    b[sz] = '\n';
+    const char *best = 0; uint32_t ba = 0;
+    for (char *q = b; q < b + sz;) {
+        uint32_t a = 0; char *s = q;
+        for (; s < q + 8; s++) a = a * 16 + (uint32_t)(*s <= '9' ? *s - '0' : (*s | 32) - 'a' + 10);
+        if (a > rva) break;
+        best = s + 1; ba = a;
+        while (*q != '\n') q++;
+        q++;
+    }
+    int k = 0;
+    if (best) for (; best[k] != '\n' && best[k] != '\r' && k < cap - 1; k++) name[k] = best[k];
+    name[k] = 0; *start = ba;
+    VirtualFree(b, 0, MEM_RELEASE);
+    return k > 0;
+}
+
 static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
 {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
@@ -72,8 +136,32 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS *ep)
         c->Eip = ret; c->Esp += 4;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    uya_log("crash: exception 0x%08lX at 0x%08X, fault address 0x%08lX", er->ExceptionCode, at,
-            er->NumberParameters > 1 ? (unsigned long)er->ExceptionInformation[1] : 0ul);
+    static volatile LONG in_crash;
+    if (InterlockedExchange(&in_crash, 1)) ExitProcess(1);   /* (a crash while reporting one) */
+    {   /* where: module+offset, the form crash_lookup.py and Windows' event log use */
+        char mod[MAX_PATH] = "?"; MEMORY_BASIC_INFORMATION mi;
+        uintptr_t base = 0;
+        if (VirtualQuery(er->ExceptionAddress, &mi, sizeof mi) && mi.Type == MEM_IMAGE) {
+            base = (uintptr_t)mi.AllocationBase;
+            if (GetModuleFileNameA((HMODULE)base, mod, sizeof mod)) { char *s = strrchr(mod, '\\'); if (s) memmove(mod, s + 1, strlen(s)); }
+        }
+        uint32_t off = (uint32_t)((uintptr_t)er->ExceptionAddress - base);
+        uya_log("crash: exception 0x%08lX at 0x%08X (%s+0x%X), fault address 0x%08lX", er->ExceptionCode, at, base ? mod : "no module",
+                off, er->NumberParameters > 1 ? (unsigned long)er->ExceptionInformation[1] : 0ul);
+        char fn[256]; uint32_t fs;
+        MEMORY_BASIC_INFORMATION me;   /* (this DLL: is the crash in it?) */
+        if (base && VirtualQuery((void *)sym_lookup, &me, sizeof me) && me.AllocationBase == (void *)base && sym_lookup(off, fn, sizeof fn, &fs))
+            uya_log("crash: in %s+0x%X", fn, off - fs);
+        /* the return addresses on the stack, named: the call chain */
+        const uint32_t *sp = (const uint32_t *)(uintptr_t)c->Esp;
+        for (int i = 0, shown = 0; i < 256 && shown < 12 && !IsBadReadPtr(sp + i, 4); i++) {
+            uintptr_t v = sp[i];
+            if (base && v > base && v < base + 0x10000000 && VirtualQuery((void *)v, &me, sizeof me) && me.AllocationBase == (void *)base &&
+                (me.Protect & 0xF0) && sym_lookup((uint32_t)(v - base), fn, sizeof fn, &fs)) {
+                uya_log("crash: called from %s+0x%X", fn, (uint32_t)(v - base) - fs); shown++;
+            }
+        }
+    }
     uya_log("crash: thread %lu, eax %08lX ecx %08lX edx %08lX ebx %08lX esi %08lX edi %08lX esp %08lX ebp %08lX",
             GetCurrentThreadId(), c->Eax, c->Ecx, c->Edx, c->Ebx, c->Esi, c->Edi, c->Esp, c->Ebp);
     {   /* the stack: return addresses near its top, then the frame chain */

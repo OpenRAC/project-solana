@@ -1,10 +1,10 @@
 {
  "game": "rac1",
- "version": "2026.10.13.2",
+ "version": "2026.10.14.1",
  "levels": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18",
  "kit_file": "rac1-build.zip",
- "kit_size": 5121567,
- "kit_sha256": "abd1bf3d10e1ad8aa9f1c57eb06a609e7b3d0b90c4b9e0cbfead1e042d5934f9",
+ "kit_size": 5125429,
+ "kit_sha256": "b6919dd6d31d1ae8fac65c2859eaa6c084e98b97af36e3a305b4253da40ba5c5",
  "toolchain_file": "toolchain-win64.zip",
  "toolchain_size": 84006129,
  "toolchain_sha256": "2d56894833ca4066faf5ac008d3fa06aa40e2bb1d1fcb8f5bd26f28a70382b63",

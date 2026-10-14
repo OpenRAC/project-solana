@@ -25,6 +25,8 @@ __declspec(dllimport) int __stdcall DeleteFileA(const char *);
 __declspec(dllimport) int __stdcall MoveFileExA(const char *, const char *, unsigned);
 __declspec(dllimport) void *__stdcall VirtualAlloc(void *, unsigned long, unsigned, unsigned);
 __declspec(dllimport) int __stdcall VirtualFree(void *, unsigned long, unsigned);
+typedef struct { void *base, *alloc_base; unsigned alloc_prot; unsigned long size; unsigned state, prot, type; } mbi_t;
+__declspec(dllimport) unsigned long __stdcall VirtualQuery(const void *, mbi_t *, unsigned long);
 __declspec(dllimport) unsigned __stdcall GetModuleFileNameA(HMODULE, char *, unsigned);
 
 #define INVALID ((HANDLE)(long)-1)
@@ -48,7 +50,7 @@ static void path(char *out, const char *dir, const char *name, int i)
 static void fail(const char *m) { MessageBoxA(0, m, "RAC1", 0x10); ExitProcess(1); }
 
 /* rac1_game.dll from its parts, when a manifest says they are there */
-static void join_parts(void)
+static __attribute__((noinline)) void join_parts(void)
 {
     char dir[600], man[700], tmp[700], dll[700], nm[700];
     unsigned dl = GetModuleFileNameA(0, dir, 520);
@@ -93,10 +95,36 @@ static void join_parts(void)
 
 void __stdcall launcher_start(void)
 {
+    /* The PS2's fixed addresses beyond RAM (EE registers, VU memory, GS registers, scratchpad),
+     * reserved before rac1_game.dll loads: if Windows relocates the DLL (Mandatory ASLR, or its
+     * address taken), it must not land on them. The runtime commits them (plat_map_fixed). */
+    VirtualAlloc((void *)0x10000000, 0x10000, 0x2000 /* MEM_RESERVE */, 1 /* PAGE_NOACCESS */);
+    VirtualAlloc((void *)0x11000000, 0x10000, 0x2000, 1);
+    VirtualAlloc((void *)0x12000000, 0x2000, 0x2000, 1);
+    VirtualAlloc((void *)0x70000000, 0x4000, 0x2000, 1);
     join_parts();
+    /* The runtime takes addresses below 0x40000000 for PS2 ones (RAM, its uncached mirrors at
+     * 0x20000000-0x3FFFFFFF, the registers), so the DLL must load at or above 0x40000000 (its own
+     * base, unless something holds it or Windows forces relocation). While it loads, every free
+     * range below that is reserved, then released: Windows can only place it higher. */
+    void *held[64]; unsigned nheld = 0;
+    for (unsigned a = 0x00010000; a < 0x40000000 && nheld < 64;) {
+        mbi_t m;
+        if (!VirtualQuery((void *)a, &m, sizeof m)) break;
+        unsigned end = (unsigned)m.base + (unsigned)m.size;
+        if (end <= a) break;
+        if (m.state == 0x10000 /* MEM_FREE */) {
+            unsigned lo = (a + 0xFFFF) & ~0xFFFFu, hi = end > 0x40000000 ? 0x40000000 : end;
+            void *r = lo < hi ? VirtualAlloc((void *)lo, hi - lo, 0x2000, 1) : 0;
+            if (r) held[nheld++] = r;
+        }
+        a = end;
+    }
     HMODULE h = LoadLibraryA("rac1_game.dll");
+    while (nheld) VirtualFree(held[--nheld], 0, 0x8000 /* MEM_RELEASE */);
     if (!h) {
-        MessageBoxA(0, "rac1_game.dll was not found next to rac1_wrapper.exe.", "UYA Wrapper", 0x10);
+        MessageBoxA(0, "rac1_game.dll could not be loaded. It should be next to rac1_wrapper.exe; if it is, "
+                       "Windows found no room for it above address 0x40000000.", "Project Solana", 0x10);
         ExitProcess(1);
     }
     uya_main_fn f = (uya_main_fn)GetProcAddress(h, "uya_main_win32");

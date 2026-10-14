@@ -10,7 +10,7 @@ Project Solana is a launcher and a set of static recompilations. Each game's cod
 
 1. Download `Project Solana.exe` from the [latest launcher release](../../releases) and put it in a folder of its own (it keeps its files next to itself).
 2. Run it and add your disc image: **Add disc image**, **Scan a folder**, or drag an `.iso` onto the window.
-3. Select the game and press **Build**. The first build downloads about 95 MB (Python and the zig compiler, then the game's build kit) and builds the game from your disc: 10 to 30 minutes depending on your CPU. It only happens once per game version.
+3. Select the game and press **Build**. The first build downloads about 95 MB (Python and the zig compiler, then the game's build kit) and builds the game from your disc: about 15 minutes on a recent 6 to 8 core CPU, an hour or more on an older 4 core one. It only happens once per game version.
 4. Press **Play**.
 
 ### Supported games
@@ -24,9 +24,10 @@ Project Solana is a launcher and a set of static recompilations. Each game's cod
 ### Requirements
 
 - Windows 10 or 11, 64-bit
-- A GPU with OpenGL 3.3 (Upscaled at 3 to 4x wants a GTX 1060 class card or better)
+- A CPU with SSE4.2 (Intel since 2008, AMD since 2011) and 8 GB of RAM
+- A GPU with OpenGL 3.3 (tested: RTX 3060, Upscaled at 3x)
 - A controller: Xbox, DualShock 4 or DualSense, over USB or Bluetooth
-- About 2 GB free while building, 300 MB after
+- About 2.5 GB free while building, 600 MB after (the game plus the build tools, kept for rebuilds)
 
 ### Settings
 
