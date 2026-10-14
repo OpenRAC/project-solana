@@ -89,7 +89,3 @@ gh release create rac1 dist/rac1/rac1.json dist/rac1/rac1-build.zip dist/rac1/to
 To update an existing game release, upload the new files over the old ones (`gh release upload rac1 dist/rac1/* --clobber`). Players get them with **Rebuild the game**.
 
 The launchers go in a release of their own (for example `launcher-v1`): `Project Solana.exe` and `project-solana` (Linux).
-
-## Licence
-
-TODO (maintainers): choose a licence for this repository. Third-party code keeps its own (see `THIRD_PARTY_NOTICES.md`).
