@@ -1,0 +1,16 @@
+{
+  "background": "#0A0E1A",
+  "sidebar": "#0F1424",
+  "card": "#151C30",
+  "card_hover": "#1C2540",
+  "border": "#26304D",
+  "text_primary": "#F4F6FB",
+  "text_secondary": "#9AA6C6",
+  "accent": "#FF7A3D",
+  "accent_hover": "#FF9461",
+  "text_on_accent": "#0A0E1A",
+  "accent_secondary": "#7FD1FF",
+  "status_green": "#3DD68C",
+  "status_amber": "#FFB238",
+  "status_red": "#FF5A5F"
+}

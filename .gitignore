@@ -1,0 +1,8 @@
+# build output and downloads
+dist/
+games/*/build/
+games/*/decomp/
+games/*/zig-cache/
+games/*/build_log.txt
+__pycache__/
+*.pyc

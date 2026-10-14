@@ -1,0 +1,7 @@
+{
+  "comment": "What toolchain-win64.zip is made of (release/make_release.py fetches these when it has no toolchain zip to reuse). All are redistributable: CPython (PSF licence), zig (MIT), rabbitizer (MIT).",
+  "version": "py3.12.7-zig0.16.0-rabbitizer1.16.2",
+  "python": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7+20241016-x86_64-pc-windows-msvc-install_only.tar.gz",
+  "ziglang_wheel": "ziglang==0.16.0",
+  "rabbitizer_wheel": "rabbitizer==1.16.2"
+}
