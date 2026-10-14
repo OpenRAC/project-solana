@@ -2095,7 +2095,7 @@ static void uya_gs_gif_(const u32 *d, u32 qwc)
 
 /* ---- init and display ---- */
 /* UYA_RENDERER=gl|soft (or renderer= in rac1_wrapper.cfg): the GPU draws
- * (default where there is GL: Windows) or the software rasterizer; GL falls
+ * (default) or the software rasterizer; GL falls
  * back to software if it cannot start */
 const char *uya_renderer_cfg;
 void uya_gs_init(void)
@@ -2107,11 +2107,7 @@ void uya_gs_init(void)
     {
         const char *r = getenv("UYA_RENDERER");
         if (!r) r = uya_renderer_cfg;
-#ifdef _WIN32
-        if (!r) r = "gl";
-#else
-        if (!r) r = "soft";
-#endif
+        if (!r) r = "gl";   /* (with no window, as headless on Linux, GL does not start: software) */
         if (!strcmp(r, "gl")) {
             if (plat_gl_init() && gsgl_init(vram)) { plat_gl_active = 1; uya_log("GS: drawing with OpenGL"); }
             else uya_log("GS: OpenGL not available, drawing in software");

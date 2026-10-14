@@ -1,5 +1,6 @@
 /* Linux (i386) platform layer: fixed mappings and the int3 trap for calls
- * into PS2 code the host does not implement. */
+ * into PS2 code the host does not implement; the window, OpenGL, gamepads and
+ * sound through SDL2 (platform_linux_sdl.h), or headless for testing. */
 #ifdef __linux__
 #define _GNU_SOURCE
 #include "uya_runtime.h"
@@ -81,10 +82,41 @@ static void on_trap(int sig, siginfo_t *si, void *ctxv)
     g[REG_ESP] = esp + 4;
 }
 
+#include <dlfcn.h>
+static void *dladdr_base(void)   /* the game executable's own load address */
+{
+    static void *b; Dl_info di;
+    if (!b && dladdr((void *)&dladdr_base, &di)) b = di.dli_fbase;
+    return b;
+}
+/* "name+0xoff" for an address in the game (its symbols are exported: -rdynamic) */
+static const char *sym_name(uint32_t a, char *buf, int cap)
+{
+    Dl_info di;
+    if (dladdr((void *)(uintptr_t)a, &di) && di.dli_sname) snprintf(buf, cap, "%s+0x%X", di.dli_sname, a - (uint32_t)(uintptr_t)di.dli_saddr);
+    else snprintf(buf, cap, "?");
+    return buf;
+}
 static void on_fault(int sig, siginfo_t *si, void *ctxv)
 {
+    static volatile int in_crash;
+    if (__atomic_exchange_n(&in_crash, 1, __ATOMIC_SEQ_CST)) _exit(1);   /* (a crash while reporting one) */
     ucontext_t *uc = ctxv;
-    uya_log("crash: signal %d, fault address %p, eip=0x%08X", sig, si->si_addr, (uint32_t)uc->uc_mcontext.gregs[REG_EIP]);
+    greg_t *g = uc->uc_mcontext.gregs;
+    char nm[256];
+    uint32_t eip = (uint32_t)g[REG_EIP];
+    uya_log("crash: signal %d, fault address %p, eip=0x%08X", sig, si->si_addr, eip);
+    uya_log("crash: in %s", sym_name(eip, nm, sizeof nm));
+    {   /* the return addresses on the stack, named: the call chain */
+        const uint32_t *sp = (const uint32_t *)(uintptr_t)(uint32_t)g[REG_ESP];
+        Dl_info di;
+        for (int i = 0, shown = 0; i < 256 && shown < 12; i++) {
+            uint32_t v = sp[i];
+            if (v >= 0x40000000u && v < 0x80000000u && dladdr((void *)(uintptr_t)v, &di) && di.dli_sname && di.dli_fbase == dladdr_base()) {
+                uya_log("crash: called from %s", sym_name(v, nm, sizeof nm)); shown++;
+            }
+        }
+    }
     uya_report();
     _exit(1);
 }
@@ -153,10 +185,10 @@ int plat_install_trap_handler(void)
 #endif
 
 #ifdef __linux__
-/* No window on Linux (yet): with UYA_DUMP=dir every 15th presented frame is
- * written there as a PPM, so output can be checked. */
+/* Headless (no display, no SDL2, or UYA_HEADLESS / UYA_DUMP set): with UYA_DUMP=dir every
+ * 15th presented frame is written there as a PPM, so output can be checked. */
 #include <stdlib.h>
-int plat_present(const uint32_t *px, int w, int h)
+static int hl_present(const uint32_t *px, int w, int h)
 {
     static unsigned long n;
     const char *dir = getenv("UYA_DUMP");
@@ -189,8 +221,7 @@ static const struct { const char *name; unsigned bit; } pad_names[] = {
     {"lup", 0x10000}, {"ldown", 0x20000}, {"lleft", 0x40000}, {"lright", 0x80000},
     {"rup", 0x100000}, {"rdown", 0x200000}, {"rleft", 0x400000}, {"rright", 0x800000},
 };
-int plat_pad_sticks(uint8_t st[4]) { (void)st; return 0; }
-unsigned plat_pad_buttons(void)
+static unsigned hl_buttons(void)
 {
     const char *s = getenv("UYA_KEYS");
     unsigned now = uya_frame_count(), bits = 0;
@@ -211,18 +242,9 @@ unsigned plat_pad_buttons(void)
     return bits;
 }
 /* UYA_SKIPMOVIES=n skips the first n movies (plat_movie_started counts them) */
-static int movies_started;
-void plat_movie_started(void) { movies_started++; }
-int plat_key_skip(void)
-{
-    const char *e = getenv("UYA_SKIPMOVIES");
-    if (e && movies_started <= atoi(e)) return 1;
-    return (plat_pad_buttons() & 0x4008) != 0;
-}
-void plat_poll(void) {}
 
 /* Sound on Linux: with UYA_DUMP set, each sound is saved there as a WAV file. */
-void plat_audio_play(const int16_t *lr, size_t frames, int rate, const char *tag)
+static void hl_audio_play(const int16_t *lr, size_t frames, int rate, const char *tag)
 {
     const char *dir = getenv("UYA_DUMP");
     if (!dir) return;
@@ -241,7 +263,6 @@ void plat_audio_play(const int16_t *lr, size_t frames, int rate, const char *tag
     fwrite(lr, 4, frames, f);
     fclose(f);
 }
-void plat_audio_stop(void) {}
 #endif
 
 #ifdef __linux__
@@ -250,7 +271,7 @@ void plat_audio_stop(void) {}
 static uint64_t stream_written, stream_t0;
 uint64_t uya_fixed_clock(void);
 static uint64_t stream_now(void) { uint64_t v = uya_fixed_clock(); return v ? v : plat_time_us(); }   /* UYA_FIXEDTIME: the game's clock */
-void plat_stream_write(const int16_t *lr, int frames)
+static void hl_stream_write(const int16_t *lr, int frames)
 {
     static FILE *f;
     static int tried;
@@ -263,18 +284,46 @@ void plat_stream_write(const int16_t *lr, int frames)
     if (f) fwrite(lr, 4, (size_t)frames, f);
     stream_written += (uint64_t)frames;
 }
-int plat_stream_queued(void)
+static int hl_stream_queued(void)
 {
     if (!stream_t0) return 0;
     uint64_t played = (stream_now() - stream_t0) * 48000 / 1000000;
     return played >= stream_written ? 0 : (int)(stream_written - played);
 }
-/* OpenGL: this build is 32-bit static (musl) and cannot load a GL driver, so
- * the GS draws in software (the GL renderer is tested with tools/gs_replay.c) */
-int plat_gl_active;
-int plat_gl_init(void) { return 0; }
-void plat_gl_current(int on) { (void)on; }
-void plat_gl_swap(void) {}
-void plat_gl_size(int *w, int *h) { *w = 640; *h = 480; }
-void *plat_gl_proc(const char *name) { (void)name; return 0; }
+#include "platform_linux_sdl.h"
+
+/* ---- what the game calls: SDL when there is a display, else headless (testing) ---- */
+int plat_present(const uint32_t *px, int w, int h) { return sdl_on() ? sdl_present(px, w, h) : hl_present(px, w, h); }
+int plat_pad_sticks(uint8_t st[4]) { return sdl_on() ? sdl_sticks(st) : 0; }
+unsigned plat_pad_buttons(void) { return hl_buttons() | (sdl_on() ? sdl_buttons() : 0); }   /* (UYA_KEYS: scripted presses) */
+/* movies: a fresh press of Cross or Start skips (buttons already held when the movie starts do not);
+ * UYA_SKIPMOVIES=n skips the first n movies (testing) */
+static int movies_started;
+static unsigned skip_held;
+void plat_movie_started(void) { movies_started++; pump(); skip_held = plat_pad_buttons() & 0x4008; }
+int plat_key_skip(void)
+{
+    const char *e = getenv("UYA_SKIPMOVIES");
+    if (e && movies_started <= atoi(e)) return 1;
+    pump();
+    unsigned b = plat_pad_buttons() & 0x4008, fresh = b & ~skip_held;
+    skip_held = b;
+    return fresh != 0;
+}
+void plat_poll(void)
+{
+    if (!win) return;
+    pump();
+    if (win_closed) { uya_log("window closed"); exit(0); }
+}
+void plat_audio_play(const int16_t *lr, size_t frames, int rate, const char *tag) { if (sdl_on()) sdl_audio_play(lr, frames, rate); else hl_audio_play(lr, frames, rate, tag); }
+void plat_audio_stop(void) { if (sdl_on()) sdl_audio_stop(); }
+void plat_stream_write(const int16_t *lr, int frames) { if (sdl_on()) sdl_stream_write(lr, frames); else hl_stream_write(lr, frames); }
+int plat_stream_queued(void) { return sdl_on() ? sdl_stream_queued() : hl_stream_queued(); }
+/* OpenGL through SDL (none headless: the GS draws in software) */
+int plat_gl_init(void) { return sdl_gl_init(); }
+void plat_gl_current(int on) { sdl_gl_current(on); }
+void plat_gl_swap(void) { sdl_gl_swap(); }
+void plat_gl_size(int *w, int *h) { sdl_gl_size(w, h); }
+void *plat_gl_proc(const char *name) { return sdl_gl_proc(name); }
 #endif

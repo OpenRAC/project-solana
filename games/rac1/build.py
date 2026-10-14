@@ -28,7 +28,9 @@ ap.add_argument("--levels", default="00")
 a = ap.parse_args()
 
 zig = [shutil.which("zig")] if shutil.which("zig") else [sys.executable, "-m", "ziglang"]
-target = {"linux": "x86-linux-musl", "windows": "x86-windows-gnu"}[a.platform]
+# Linux: 32-bit glibc 2.17 or newer (any distribution since 2013), linked dynamically so it can load
+# the system's SDL2 and OpenGL driver (32-bit: i386 libraries)
+target = {"linux": "x86-linux-gnu.2.17", "windows": "x86-windows-gnu"}[a.platform]
 out = os.path.join(HERE, "build", a.platform)
 gen = os.path.join(out, "gen")
 stage = os.path.join(out, "gen.new")
@@ -145,6 +147,7 @@ sync(stage, gen)
 
 common = ["-target", target, "-O" + a.O, "-g", "-march=nehalem", "-mfpmath=sse", "-malign-double", "-fno-strict-aliasing", "-fwrapv",
           "-fno-PIE", "-fno-stack-protector", "-I", os.path.join(gen, "include"), "-I", os.path.join(HERE, "host", "include")]
+if a.platform == "linux": common += ["-D_FILE_OFFSET_BITS=64"]   # (32-bit glibc: disc images are over 2 GB)
 # frontbin code: keep it permissive, it was written for gcc 2.95
 menu_flags = ["-w", "-Wno-error=incompatible-pointer-types", "-Wno-error=int-conversion",
               "-Wno-error=implicit-function-declaration", "-Wno-error=implicit-int",
@@ -228,7 +231,10 @@ if errs:
     sys.exit("%d files failed to compile" % len(errs))
 if a.platform == "linux":
     exe = os.path.join(out, "rac1_wrapper")
-    link = zig + ["cc", "-target", target, "-o", exe, objs_rsp("link")] + ["-static", "-no-pie", "-Wl,--image-base=0x40000000"]
+    # at 0x40000000 like the Windows DLL (lower addresses are the PS2's); its symbols exported
+    # (-rdynamic) so the crash handler can name functions
+    link = zig + ["cc", "-target", target, "-o", exe, objs_rsp("link")] + ["-no-pie", "-rdynamic", "-Wl,--image-base=0x40000000",
+                                                                            "-ldl", "-lpthread", "-lm"]
     r = subprocess.run(link, capture_output=True, text=True)
     if r.returncode:
         print(r.stderr[-6000:]); sys.exit("link failed")
