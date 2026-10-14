@@ -26,7 +26,7 @@ OTHER = {"SCUS_971.99": "Ratchet & Clank (NTSC-U)", "SCPS_150.37": "Ratchet & Cl
          "SCUS_973.53": "Ratchet & Clank: Up Your Arsenal (NTSC-U)", "SCES_524.56": "Ratchet & Clank 3 (PAL)",
          "SCUS_974.65": "Ratchet: Deadlocked (NTSC-U)", "SCES_532.85": "Ratchet: Gladiator (PAL)"}
 
-VERSION = "1.4"
+VERSION = "1.5"
 HOME = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "project-solana")
 INI = os.path.join(HOME, "solana.ini")
 LAUNCHER_LOG = os.path.join(HOME, "launcher_log.txt")
@@ -432,7 +432,7 @@ def desktop(args):
     p = os.path.join(d, "project-solana-rac1.desktop")
     with open(p, "w") as f:
         f.write("[Desktop Entry]\nType=Application\nName=Ratchet & Clank (Project Solana)\nComment=Built from your own disc\n"
-                "Exec=\"%s\" play\nTerminal=false\nCategories=Game;\n" % me)
+                "Exec=python3 \"%s\" play\nTerminal=false\nCategories=Game;\n" % me)   # (python3: works without the executable bit)
     say("Added %s" % p)
     say("Steam: Games > Add a Non-Steam Game to My Library, and pick \"Ratchet & Clank (Project Solana)\".")
 
@@ -535,6 +535,11 @@ def main():
     a = ap.parse_args()
     if sys.platform != "linux": die("this is the Linux launcher: on Windows, use Project Solana.exe")
     log("project-solana %s: %s" % (VERSION, " ".join(sys.argv[1:])))
+    try:   # downloads lose the executable bit: set it, so ./project-solana works next time
+        me = os.path.abspath(sys.argv[0]); m = os.stat(me).st_mode
+        if not m & 0o100: os.chmod(me, m | 0o111)
+    except OSError:
+        pass
     try:
         {"build": build, "play": play, "status": status, "desktop": desktop, "log": show_log, "report": report}.get(a.cmd, lambda _: ap.print_help())(a)
     except SystemExit:

@@ -15,10 +15,10 @@ Project Solana is a launcher and a set of static recompilations. Each game's cod
 
 ## Playing on Linux and Steam Deck
 
-The game runs natively on Linux (no Wine or Proton). The Linux launcher is a single script, `launcher/linux/project-solana` (download it from the [latest launcher release](../../releases), then `chmod +x project-solana`):
+The game runs natively on Linux (no Wine or Proton). The Linux launcher is a single script, `launcher/linux/project-solana` (download it from the [latest launcher release](../../releases)). Start it the first time with `python3`; that also makes it executable, so `./project-solana` works afterwards:
 
 ```
-./project-solana build ~/Games/ratchet.iso   # once: about 95 MB of downloads, then the same build as on Windows
+python3 project-solana build ~/Games/ratchet.iso   # once: about 95 MB of downloads, then the same build as on Windows
 ./project-solana play                        # --upscaled / --native, --fullscreen / --windowed, --vsync (remembered)
 ./project-solana desktop                     # adds it to the applications menu; from there, Steam > Add a Non-Steam Game
 ```
