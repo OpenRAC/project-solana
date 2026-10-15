@@ -36,6 +36,7 @@ typedef struct {
     const wchar_t *exe;          /* its wrapper in that folder (0: not supported yet) */
     const wchar_t *kit;          /* its GitHub release tag and folder under games\ (the Build button) */
     const wchar_t *const *levels;
+    const wchar_t *rgn;          /* build.py --region (0: pal); its output is build\windows_<rgn> */
 } game_t;
 
 static const wchar_t *const rac1_levels[] = {
@@ -45,7 +46,7 @@ static const wchar_t *const rac1_levels[] = {
 
 static const game_t games[] = {
     { "SCES_509.16", L"Ratchet & Clank", L"PAL", "d86429e2eca4e1da7d7f1cc656af2574", L"games\\rac1\\build\\windows", L"rac1_wrapper.exe", L"rac1", rac1_levels },
-    { "SCUS_971.99", L"Ratchet & Clank", L"NTSC-U", 0, 0, 0, 0, 0 },
+    { "SCUS_971.99", L"Ratchet & Clank", L"NTSC-U", "0c081d4e0353b419d95e5f95eb0ebacb", L"games\\rac1\\build\\windows_us", L"rac1_wrapper.exe", L"rac1", rac1_levels, L"us" },
     { "SCPS_150.37", L"Ratchet & Clank", L"NTSC-J", 0, 0, 0, 0, 0 },
     { "SCES_516.07", L"Ratchet & Clank 2", L"PAL", 0, 0, 0, 0, 0 },
     { "SCUS_972.68", L"Ratchet & Clank: Going Commando", L"NTSC-U", 0, 0, 0, 0, 0 },

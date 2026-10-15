@@ -96,11 +96,15 @@ static int glob_match(const char *p, const char *s)
 /* Card path ("/DIR/file" or "DIR/file") to a host path. Wildcards in the
  * directory part pick the first directory that matches. Returns 0 if a
  * wildcard directory had no match. */
+static char mc_cwd[2][512] = {"/", "/"};   /* sceMcChdir's current directory (the NTSC-U game sets it) */
 static int host_path(int port, const char *name, char *out, size_t n, char *last, size_t nlast)
 {
     char tmp[512], cur[1024];
     snprintf(cur, sizeof cur, "%s", slot_dir(port));
-    snprintf(tmp, sizeof tmp, "%s", name ? name : "");
+    if (name && name[0] != '/' && strcmp(mc_cwd[port & 1], "/"))
+        snprintf(tmp, sizeof tmp, "%s/%s", mc_cwd[port & 1], name);   /* relative to the current directory */
+    else
+        snprintf(tmp, sizeof tmp, "%s", name ? name : "");
     char *parts[16]; int np = 0;
     for (char *t = strtok(tmp, "/"); t && np < 16; t = strtok(0, "/")) parts[np++] = t;
     for (int i = 0; i < np - 1; i++) {
@@ -174,6 +178,32 @@ s32 uyafn_12E400(s32 port, s32 slot, s32 *type, s32 *free_kb, s32 *format)
     if (free_kb) { long f = CARD_KB - 1 - used_kb(slot_dir(port)); *free_kb = f < 0 ? 0 : (s32)f; }
     finish(1, seen[port & 1] ? 0 : -1);          /* first look: "a formatted card was inserted" */
     seen[port & 1] = 1;
+    return 0;
+}
+
+/* sceMcChdir(port, slot, new, cur*) (RPC 0x0C): the card's current directory
+ * for relative names; cur, if given, gets the previous one. PAL's game never
+ * calls it; NTSC-U's sets "/" before listing (host/region/us maps it). */
+s32 rac1_mc_chdir(s32 port, s32 slot, const char *dir, char *prev)
+{
+    (void)slot;
+    if (mclog()) uya_log("memory card: chdir %s", dir ? dir : "(null)");
+    if (!card_present(port)) { finish(0xC, -10); return 0; }
+    if (prev) snprintf(prev, 1024, "%s", mc_cwd[port & 1]);
+    char want[512];
+    if (!dir || !*dir) { finish(0xC, 0); return 0; }
+    if (dir[0] == '/') snprintf(want, sizeof want, "%s", dir);
+    else if (!strcmp(dir, "..")) {
+        snprintf(want, sizeof want, "%s", mc_cwd[port & 1]);
+        char *sl = strrchr(want, '/'); if (sl && sl != want) *sl = 0; else snprintf(want, sizeof want, "/");
+    } else snprintf(want, sizeof want, "%s%s%s", mc_cwd[port & 1], strcmp(mc_cwd[port & 1], "/") ? "/" : "", dir);
+    size_t l = strlen(want);
+    while (l > 1 && want[l - 1] == '/') want[--l] = 0;
+    char hp[1024];
+    snprintf(hp, sizeof hp, "%s%s", slot_dir(port), want);
+    if (!is_dir(hp)) { finish(0xC, -4); return 0; }   /* no such directory */
+    snprintf(mc_cwd[port & 1], sizeof mc_cwd[0], "%s", want);
+    finish(0xC, 0);
     return 0;
 }
 

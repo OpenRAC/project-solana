@@ -410,7 +410,7 @@ static u32 bank_add(const u8 *src, u32 size)
         b->nsounds = (s16)rd16(b->sblk + 0x16);
         b->first_sound = rd32(b->sblk + 0x1C);
         b->first_grain = rd32(b->sblk + 0x20);
-        b->handle = 0x00120000u + (u32)i * 0x1000u + ((++bank_serial) & 0xFFF);
+        b->handle = 0x00120000u + (u32)i * 0x1000u + ((++bank_serial) & 0xFFF);   /* region:keep */
         if (rd32(b->sblk + 4) != 1) uya_log("989snd: SBlk version %u (only 1 is expected)", rd32(b->sblk + 4));
         uya_log("989snd: bank %08X loaded: %d sounds, %u KB of samples", b->handle, b->nsounds, b->smp_size / 1024);
         if (snd_log > 0 && getenv("UYA_DUMP")) {               /* for checking: the bank as loaded */

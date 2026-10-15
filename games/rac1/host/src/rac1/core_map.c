@@ -107,7 +107,7 @@ s32 func_00118E70(s32 reg) { (void)reg; return 0x00070000; }         /* sceSifGe
  *    game sends the data with sceSifSetDma (above). Without it every stash
  *    slot was refused (size 0) and the pause menu unpacked the weapon data
  *    from a scrubbed buffer (a crash reading 0xDEE6BEEF). ---------- */
-#define STASH_BASE 0x00160000u
+#define STASH_BASE 0x00160000u                       /* an IOP address (region:keep) */
 #define STASH_SIZE 0x00094000u
 void func_0011AE20(s32 mode) { (void)mode; }                         /* sceSifInitRpc */
 s32 func_0011B2F8(void *cd, u32 server, s32 mode)                    /* sceSifBindRpc */

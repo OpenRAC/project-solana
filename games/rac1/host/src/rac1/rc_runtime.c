@@ -144,7 +144,7 @@ const char *rc_stack_scan(void)
     t[0] = 0;
     for (int i = 0; sp && i < 1024 && k < 12; i += 2) {
         u32 v = sp[i];
-        if (v >= 0x00112380u && v < 0x00300000u && !(v & 3) && (v & 0xFFFF) && v != 0x00160000u && v != 0x00170000u) {
+        if (v >= 0x00112380u && v < 0x00300000u && !(v & 3) && (v & 0xFFFF) && v != 0x00160000u && v != 0x00170000u) { /* region:keep */
             n += snprintf(t + n, sizeof t - n, " %08X@%d", v, i * 4); k++;
         }
     }

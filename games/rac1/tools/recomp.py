@@ -43,6 +43,11 @@ rabbitizer.config.pseudos_enablePseudos = False
 
 GEN, REPO = sys.argv[1], sys.argv[2]
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REGION = os.environ.get("UYA_REGION", "pal")
+HOSTDIR = os.environ.get("UYA_HOST") or os.path.join(HERE, "host")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import region as _region
+RC = _region.consts(REGION)
 LEVEL = DUMP = EXEGEN = None
 _a = sys.argv[3:]
 while _a:
@@ -53,14 +58,15 @@ while _a:
     else: sys.exit("recomp.py: unknown option " + _o)
 LV = "%02d" % LEVEL if LEVEL is not None else None
 P = "rc_" if LEVEL is None else "rc%s_" % LV        # prefix of the generated symbols
-RESIDENT = 0x0015F000
+RESIDENT = RC["resident"]   # PAL 0x0015F000
 
 # ---- inputs -----------------------------------------------------------------
 # testing: UYA_RC_TRACE="func_A,func_B" (build time) logs every call of those translated functions
 TRACE_FUNCS = set(x for x in os.environ.get("UYA_RC_TRACE", "").split(",") if x)
-EXE = os.environ.get("UYA_EXE") or os.path.join(REPO, "baserom", "SCES_509.16")   # build.py: the copy read from the disc image
+EXE = os.environ.get("UYA_EXE") or os.path.join(REPO, "baserom", RC["exe"])   # build.py: the copy read from the disc image
 img = open(EXE, "rb").read()
-TEXT_LO, TEXT_HI = 0x00100080, 0x00100080 + 0x13E6B0
+TEXT_LO = 0x00100080   # the executable's one loadable segment (PAL size 0x13E6B0)
+TEXT_HI = TEXT_LO + struct.unpack_from("<I", img, struct.unpack_from("<I", img, 28)[0] + 16)[0]
 LTEXT_LO = LTEXT_HI = 0
 if LEVEL is not None:
     _ld = os.path.join(DUMP, "level_%s" % LV)
@@ -86,16 +92,15 @@ for u in report["units"]:
             fsize[f["name"]] = (int(md["virtual_address"]), int(f["size"]))
 sigs = json.load(open(os.path.join(GEN, "sigs.json")))
 entries = json.load(open(os.path.join(GEN, "asm_entries.json")))
-overrides = {os.path.basename(p)[:-2] for p in os.listdir(os.path.join(HERE, "host", "overrides")) if p.endswith(".c")} if os.path.isdir(os.path.join(HERE, "host", "overrides")) else set()
+overrides = {os.path.basename(p)[:-2] for p in os.listdir(os.path.join(HOSTDIR, "overrides")) if p.endswith(".c")} if os.path.isdir(os.path.join(HOSTDIR, "overrides")) else set()
 
 todo = [n for n in entries if n in fsize and n not in overrides and re.fullmatch(r"func_[0-9A-F]{8}", n)
         and not (n in sigs and sigs[n].get("src") == "def")
         and TEXT_LO <= fsize[n][0] < TEXT_HI]
 # Sony libraries that are pure computation are translated too (libvu0: the
 # sceVu0 matrix and vector routines, core_text 0x1252A0-0x125630)
-EXTRA_RANGES = [(0x001252A0, 0x00125630),
-                # libgcc (64-bit integer and soft-float helpers; level code calls some the executable's C does not)
-                (0x0011DF10, 0x001207B8)]
+EXTRA_RANGES = RC["extra_ranges"]   # PAL 0x001252A0-0x00125630, and libgcc 0x0011DF10-0x001207B8
+                # (libgcc: 64-bit integer and soft-float helpers; level code calls some the executable's C does not)
 todo += [n for n, (a, sz) in fsize.items() if any(lo <= a < hi for lo, hi in EXTRA_RANGES)
          and re.fullmatch(r"func_[0-9A-F]{8}", n) and not (n in sigs and sigs[n].get("src") == "def") and n not in overrides]
 base_of = {}
@@ -259,7 +264,7 @@ else:
     _is_start_x = {a for a, _ in _starts_x}
     _abs = os.path.join(GEN, "abs_syms.s")
     _cand = {int(x, 16) for x in re.findall(r"\.set\s+_?D_([0-9A-F]{8})\w*,", open(_abs).read())} if os.path.exists(_abs) else set()
-    _cand = {v for v in _cand if 0x001E9080 <= v < 0x0023E740}
+    _cand = {v for v in _cand if RC["main_text"][0] <= v < RC["main_text"][1]}
     # and functions the C (the executable's and the levels') calls by an address
     # inside an assembly-only function: func_001252C0 is 0x20 into libvu0's
     # func_001252A0 (the levels' hero code calls it)
@@ -277,7 +282,7 @@ else:
             _w = struct.unpack_from("<I", _d, _i)[0]
             if _w >> 26 == 3:
                 _t = (_w & 0x3FFFFFF) << 2
-                if TEXT_LO <= _t < 0x0015F000: _cand.add(_t)
+                if TEXT_LO <= _t < RESIDENT: _cand.add(_t)
     for _v in sorted(_cand):
         if not (TEXT_LO <= _v < TEXT_HI) or _v % 4 or _v in _is_start_x: continue
         _own = [(a, e) for a, e in _starts_x if a < _v < e]

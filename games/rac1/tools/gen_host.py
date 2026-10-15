@@ -48,9 +48,15 @@ while _a:
 LV = "%02d" % LEVEL if LEVEL is not None else None
 SFX = "_l%s" % LV if LEVEL is not None else ""
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the region (build.py --region): its host sources (tools/region.py writes them) and constants
+REGION = os.environ.get("UYA_REGION", "pal")
+HOSTDIR = os.environ.get("UYA_HOST") or os.path.join(HERE, "host")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import region as _region
+RC = _region.consts(REGION)
 PLAT = os.environ.get("RAC_PLATFORM", os.environ.get("UYA_PLATFORM", "linux"))  # linux | windows (COFF i386 adds a leading _)
 os.makedirs(OUT, exist_ok=True)
-overrides = {os.path.basename(p)[:-2] for p in glob.glob(os.path.join(HERE, "host", "overrides", "func_*.c"))}
+overrides = {os.path.basename(p)[:-2] for p in glob.glob(os.path.join(HOSTDIR, "overrides", "func_*.c"))}
 ASM_MACRO = re.compile(r"^\s*(INCLUDE_ASM|ASM_FUNC|LINKER_REMNANT|INCLUDE_RODATA|TEXT_PADDING)\s*\(([^()]*)\)\s*;?\s*(?:/\*.*?\*/|//.*)?\s*$", re.M)
 
 
@@ -82,7 +88,7 @@ def strip_comments_keep_len(s):
 
 host_defined = set()
 STATIC = os.environ.get("UYA_STATIC", "1") != "0"   # RAC1_STATICRECOMP: translate the whole game from its bytes
-for p in glob.glob(os.path.join(HERE, "host", "src", "**", "*.c"), recursive=True):
+for p in glob.glob(os.path.join(HOSTDIR, "src", "**", "*.c"), recursive=True):
     host_defined |= set(re.findall(r"^[\w \t\*]*\b(func_(?:L\d\d_)?[0-9A-Fa-f]{6,8})\s*\([^;{]*\)\s*\{", strip_comments_keep_len(open(p).read()), re.M))
 
 
@@ -171,8 +177,8 @@ def rewrite_types(s):
 DECL = re.compile(r"^[ \t]*(?:extern[ \t]+)?(?P<t>[A-Za-z_][\w \t\*]*?)[ \t\*]*\b(?P<n>(?:func|D)_(?:L\d\d_)?[0-9A-Fa-f]{6,8}\w*)[ \t]*(?P<s>\((?:[^;{}]*)\)|\[[^;{}]*\])?[ \t]*;", re.M)
 
 
-MAIN_TEXT = (0x001E9080, 0x0023E740)   # the executable's game program (.text of the main segment)
-RESIDENT = 0x0015F000                   # below: core segment and core_lit, the same in every program
+MAIN_TEXT = RC["main_text"]   # the executable's game program (.text of the main segment); PAL 0x001E9080-0x0023E740
+RESIDENT = RC["resident"]     # below: core segment and core_lit, the same in every program; PAL 0x0015F000
 PLACES = {}                             # level mode: catalogue name -> its addresses in this level
 CAT_KIND = {}
 CAT_SIZE = {}
@@ -333,7 +339,7 @@ if LEVEL is None: os.makedirs(INC, exist_ok=True)
 for h in (glob.glob(os.path.join(REPO, "include", "*.h")) if LEVEL is None else []):
     bn = os.path.basename(h)
     if bn == "common.h":
-        t = open(os.path.join(HERE, "host", "include", "rac1_common.h")).read()
+        t = open(os.path.join(HOSTDIR, "include", "rac1_common.h")).read()
     elif bn == "include_asm.h":
         t = "/* host: assembly inclusion has no meaning on the PC */\n"
     else:
@@ -344,7 +350,7 @@ for h in (glob.glob(os.path.join(REPO, "include", "*.h")) if LEVEL is None else 
 
 stubbed, defined, asm_entries, report = [], set(), [], {}
 gen_texts = {}
-drafts = {os.path.basename(p)[:-2]: p for p in glob.glob(os.path.join(HERE, "host", "drafts", "func_*.c"))}
+drafts = {os.path.basename(p)[:-2]: p for p in glob.glob(os.path.join(HOSTDIR, "drafts", "func_*.c"))}
 used_drafts = set()
 files = sorted(os.path.relpath(p, REPO) for p in glob.glob(os.path.join(REPO, "src", "game", "*.c")))
 files += sorted(os.path.relpath(p, REPO) for p in glob.glob(os.path.join(REPO, "src", "game", "movie", "*.c")))
@@ -359,6 +365,9 @@ dropped = []      # level mode: functions of other levels' programs
 # the EE ABI but not for x86 (each entry: file, old text, new text)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from source_patches import PATCHES
+if REGION != "pal":   # (written against the PAL sources: in the region's names, as tools/region.py rewrote them)
+    _rw = _region.Rewriter(_region.RegionMap(_region.REGIONS[REGION]["map"]))
+    PATCHES = [(pf, _rw.text(old, "patch:" + pf), _rw.text(new, "patch:" + pf)) for pf, old, new in PATCHES]
 patches_applied = 0
 # names.h: readable names are macros for the address names; expand them in
 # the C (outside string literals) so every later pass sees func_/D_ names.
@@ -453,7 +462,8 @@ for rel in files:
     # UYA_FORCE_ASM="" compiles all the C; or a list: file substrings, re:regex,
     # !file (keep that file's C), e.g. "help_0020CDF0,help_00232560" (the old default).
     _fa = os.environ.get("UYA_FORCE_ASM", "re:.")
-    if LEVEL is not None and _fa:
+    # (another region: the executable's C too, so all of it comes from the region's own bytes)
+    if (LEVEL is not None or REGION != "pal") and _fa:
         _ex = [t[1:] for t in _fa.split(",") if t.startswith("!")]
         if any(x and x in rel for x in _ex): _fa = ""            # "!file-substring": that file keeps its C
         for tok in _fa.split(","):
@@ -483,7 +493,9 @@ for rel in files:
             seg = "/* host: top-level asm removed */"
         else:
             name, bpos = extra
-            if LEVEL is not None and base_func(name) == name and (name.startswith("func_L") or is_main_func(name)) and name not in PLACES:
+            # (another region: func_palonly_X, a PAL function with no counterpart found in this region,
+            # is not in any of its programs either; its C would be defined once per level)
+            if LEVEL is not None and (name.startswith("func_palonly_") or base_func(name) == name and (name.startswith("func_L") or is_main_func(name)) and name not in PLACES):
                 dropped.append(name)
                 out.append("/* host: %s is not in level %s's program */" % (name, LV)); pos = e
                 continue
@@ -602,7 +614,7 @@ for fn, t in gen_texts.items():
         rets[q.group(1)] = ret_type(t[q.start():q.start(1) + len(q.group(1))], q.group(1))
 # host functions (host/src, host/overrides) too: a decomp call that leaves out
 # arguments the EE would still pass in registers gets them filled in
-for hp in glob.glob(os.path.join(HERE, "host", "src", "**", "*.c"), recursive=True) + glob.glob(os.path.join(HERE, "host", "overrides", "*.c")):
+for hp in glob.glob(os.path.join(HOSTDIR, "src", "**", "*.c"), recursive=True) + glob.glob(os.path.join(HOSTDIR, "overrides", "*.c")):
     ht = open(hp, errors="replace").read()
     hm = strip_comments_keep_len(ht)
     for q in HDR.finditer(hm):
@@ -808,7 +820,7 @@ for n, p in defs.items():
     a = ps2_addr(n)
     if a is not None and re.fullmatch(r"func_(?:L\d\d_)?[0-9A-Fa-f]{8}", n) and not any(x[0] == "..." for x in p):
         fdefs[a] = p
-for op_ in glob.glob(os.path.join(HERE, "host", "overrides", "func_*.c")):
+for op_ in glob.glob(os.path.join(HOSTDIR, "overrides", "func_*.c")):
     ot = open(op_, errors="replace").read()
     for q in HDR.finditer(strip_comments_keep_len(ot)):
         n = q.group(1); a = ps2_addr(n)
@@ -1224,7 +1236,7 @@ for fn_, t_ in gen_texts.items():
 # value in an int (`int mode = GetEffectTex(1);` then passed on as the texture),
 # gets 64 bits: on the EE the register keeps all of them whatever the C says.
 _r64 = sorted(n for n, s in sigs.items() if s.get("src") == "decl" and s["ret"] == "l" and re.fullmatch(r"func_(?:L\d\d_)?[0-9A-Fa-f]{8}", n)
-              and (s.get("addr") or 0) >= 0x0015F000)     # game code (the core's library calls are the host's)
+              and (s.get("addr") or 0) >= RESIDENT)     # game code (the core's library calls are the host's)
 if _r64:
     _names = "|".join(re.escape(n) for n in _r64)
     _INT = r"(?:int|s32|u32|unsigned int|unsigned|signed int|signed)"

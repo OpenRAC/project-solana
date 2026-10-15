@@ -19,14 +19,16 @@ import argparse, configparser, hashlib, json, os, shutil, struct, subprocess, sy
 
 RELEASE_URL = "https://github.com/OpenRAC/project-solana/releases/download/"
 GAMES = {   # serial (BOOT2 in SYSTEM.CNF): what this version is
-    "SCES_509.16": {"title": "Ratchet & Clank (PAL)", "kit": "rac1", "md5": "d86429e2eca4e1da7d7f1cc656af2574", "exe": "rac1_wrapper"},
+    "SCES_509.16": {"title": "Ratchet & Clank (PAL)", "id": "rac1", "region": "pal", "kit": "rac1", "md5": "d86429e2eca4e1da7d7f1cc656af2574", "exe": "rac1_wrapper"},
+    "SCUS_971.99": {"title": "Ratchet & Clank (NTSC-U)", "id": "rac1us", "region": "us", "kit": "rac1", "md5": "0c081d4e0353b419d95e5f95eb0ebacb", "exe": "rac1_wrapper"},
 }
-OTHER = {"SCUS_971.99": "Ratchet & Clank (NTSC-U)", "SCPS_150.37": "Ratchet & Clank (NTSC-J)",
+BY_ID = {g["id"]: g for g in GAMES.values()}
+OTHER = {"SCPS_150.37": "Ratchet & Clank (NTSC-J)",
          "SCUS_972.68": "Ratchet & Clank: Going Commando (NTSC-U)", "SCES_516.07": "Ratchet & Clank 2 (PAL)",
          "SCUS_973.53": "Ratchet & Clank: Up Your Arsenal (NTSC-U)", "SCES_524.56": "Ratchet & Clank 3 (PAL)",
          "SCUS_974.65": "Ratchet: Deadlocked (NTSC-U)", "SCES_532.85": "Ratchet: Gladiator (PAL)"}
 
-VERSION = "1.5"
+VERSION = "1.6"
 HOME = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "project-solana")
 INI = os.path.join(HOME, "solana.ini")
 LAUNCHER_LOG = os.path.join(HOME, "launcher_log.txt")
@@ -63,6 +65,20 @@ def die(msg):
     log("error: " + msg)
     notify(msg + "\n\n(project-solana report writes a file to send with a bug report)")
     sys.exit("project-solana: " + msg)
+
+
+def out_dir(g):
+    """the game's build output (and its saves): build/linux, build/linux_us"""
+    return os.path.join(HOME, "games", g["kit"], "build", "linux" if g["region"] == "pal" else "linux_" + g["region"])
+
+
+def chosen(c, want=None):
+    """the game to play: --game, else the one built last (else PAL)"""
+    if want:
+        g = BY_ID.get(want) or BY_ID.get("rac1" + want) or (BY_ID["rac1"] if want == "pal" else None)
+        if not g: die("no game %s: pal or us" % want)
+        return g
+    return BY_ID.get(c.get("play", "game", fallback="rac1"), BY_ID["rac1"])
 
 
 def settings():
@@ -343,7 +359,8 @@ def build(args):
         if os.path.isdir(gdir):   # everything but the build output (and its saves); a new kit version builds from scratch
             for e in os.listdir(gdir):
                 if e != "build": rmtree(os.path.join(gdir, e))
-            rmtree(os.path.join(gdir, "build", "linux", "gen")); rmtree(os.path.join(gdir, "build", "linux", "obj"))
+            for b in ("linux", "linux_us"):
+                rmtree(os.path.join(gdir, "build", b, "gen")); rmtree(os.path.join(gdir, "build", b, "obj"))
         unzip(zp, gdir, "build kit"); os.remove(zp)
         open(kv, "w").write(man["version"])   # (unpacked: an interrupted build resumes with what it compiled)
 
@@ -356,7 +373,7 @@ def build(args):
     env = dict(os.environ, PATH=os.path.join(tc_dir, "zig") + os.pathsep + os.environ.get("PATH", ""), PYTHONUTF8="1",
                ZIG_GLOBAL_CACHE_DIR=os.path.join(gdir, "zig-cache"), ZIG_LOCAL_CACHE_DIR=os.path.join(gdir, "zig-cache"))
     py = os.path.join(tc_dir, "python", "bin", "python3")
-    cmd = [py, "-u", "build.py", "--platform", "linux", "--levels", levels, "--iso", iso, "--repo", "decomp", "-j", str(jobs)]
+    cmd = [py, "-u", "build.py", "--platform", "linux", "--region", g["region"], "--levels", levels, "--iso", iso, "--repo", "decomp", "-j", str(jobs)]
     log = open(os.path.join(gdir, "build_log.txt"), "w")
     raise_open_files()
     p = subprocess.Popen(cmd, cwd=gdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -365,22 +382,25 @@ def build(args):
         if not progress_line(line) and ("error" in line.lower() or "failed" in line.lower()): print("\n  " + line.rstrip())
     p.wait(); log.close(); print()
     if p.returncode: die("the build stopped (see %s)" % os.path.join(gdir, "build_log.txt"))
-    for j in ("build/linux/gen", "build/linux/gen.new", "build/linux/obj", "build/levels", "build/disc", "zig-cache"): rmtree(os.path.join(gdir, j))
-    c.set("disc", kit, iso); c.set("build", "built_" + kit, man["version"]); save(c)
-    say("Built. Ready to play: project-solana play")
+    bd = os.path.relpath(out_dir(g), gdir)
+    for j in (bd + "/gen", bd + "/gen.new", bd + "/obj", bd + "/region", "build/levels", "build/levels_us", "build/disc", "zig-cache"): rmtree(os.path.join(gdir, j))
+    c.set("disc", g["id"], iso); c.set("build", "built_" + g["id"], man["version"]); c.set("play", "game", g["id"]); save(c)
+    other = [x for x in BY_ID.values() if x is not g and c.get("build", "built_" + x["id"], fallback="")]
+    say("Built. Ready to play: project-solana play" + ("  (the other version: project-solana play --game %s)" % other[0]["region"] if other else ""))
 
 
 # ---- play ----
 def play(args):
     c = settings()
-    kit = "rac1"
-    iso = c.get("disc", kit, fallback="")
-    exe = os.path.join(HOME, "games", kit, "build", "linux", GAMES["SCES_509.16"]["exe"])
+    g = chosen(c, args.game)
+    iso = c.get("disc", g["id"], fallback="")
+    exe = os.path.join(out_dir(g), g["exe"])
     if not os.path.exists(exe) or not iso: die("not built yet: run  project-solana build /path/to/your/disc.iso")
     if not os.path.exists(iso): die("the disc image has moved (%s): build again with its new path" % iso)
     pc = c["play"]
     for k, v in (("resolution", args.resolution), ("fullscreen", args.fullscreen), ("vsync", args.vsync)):
         if v is not None: pc[k] = str(v)
+    pc["game"] = g["id"]
     save(c)
     env = dict(os.environ)
     deck = os.environ.get("SteamDeck") == "1" or is_steamos()   # (Steam Deck, Steam Machine: full screen by default)
@@ -399,7 +419,7 @@ def play(args):
     gdir = os.path.dirname(exe)
     out = os.path.join(gdir, "game_output.txt")   # what SDL, the graphics driver and the game print (kept: one run back)
     if os.path.exists(out): os.replace(out, out + ".prev")
-    log("play: %s (UYA_SCALE=%s, fullscreen %s, vsync %s)" % (iso, env.get("UYA_SCALE", "1"), full, pc.get("vsync", "0")))
+    log("play: %s, %s (UYA_SCALE=%s, fullscreen %s, vsync %s)" % (g["title"], iso, env.get("UYA_SCALE", "1"), full, pc.get("vsync", "0")))
     with open(out, "w") as o:
         try:
             p = subprocess.Popen([exe, "-", iso], cwd=gdir, env=env, stdout=o, stderr=subprocess.STDOUT)
@@ -418,9 +438,9 @@ def status(args):
     say("Data folder: %s" % HOME)
     tv = os.path.join(HOME, "toolchain", "version.txt")
     say("Build tools: %s" % (open(tv).read().strip() if os.path.exists(tv) else "not downloaded"))
-    for kit in ("rac1",):
-        b = c.get("build", "built_" + kit, fallback="")
-        say("%s: %s, disc %s" % (kit, ("built from kit " + b) if b else "not built", c.get("disc", kit, fallback="(none)")))
+    for g in BY_ID.values():
+        b = c.get("build", "built_" + g["id"], fallback="")
+        say("%s: %s, disc %s" % (g["title"], ("built from kit " + b) if b else "not built", c.get("disc", g["id"], fallback="(none)")))
     say("32-bit SDL2 and OpenGL: %s" % ("found" if check_libs(quiet=True) else "missing"))
     if not check_libs(quiet=True): check_libs()
 
@@ -429,16 +449,20 @@ def desktop(args):
     me = os.path.abspath(sys.argv[0])
     d = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "applications")
     os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, "project-solana-rac1.desktop")
-    with open(p, "w") as f:
-        f.write("[Desktop Entry]\nType=Application\nName=Ratchet & Clank (Project Solana)\nComment=Built from your own disc\n"
-                "Exec=python3 \"%s\" play\nTerminal=false\nCategories=Game;\n" % me)   # (python3: works without the executable bit)
-    say("Added %s" % p)
-    say("Steam: Games > Add a Non-Steam Game to My Library, and pick \"Ratchet & Clank (Project Solana)\".")
+    c = settings()
+    built = [g for g in BY_ID.values() if c.get("build", "built_" + g["id"], fallback="")] or [BY_ID["rac1"]]
+    for g in built:
+        name = "Ratchet & Clank (Project Solana)" if len(built) == 1 else "%s (Project Solana)" % g["title"]
+        p = os.path.join(d, "project-solana-%s.desktop" % g["id"])
+        with open(p, "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=%s\nComment=Built from your own disc\n"
+                    "Exec=python3 \"%s\" play --game %s\nTerminal=false\nCategories=Game;\n" % (name, me, g["region"]))   # (python3: works without the executable bit)
+        say("Added %s" % p)
+        say("Steam: Games > Add a Non-Steam Game to My Library, and pick \"%s\"." % name)
 
 
 def show_log(args):
-    p = os.path.join(HOME, "games", "rac1", "build", "linux", "rac1_log.txt")
+    p = os.path.join(out_dir(chosen(settings(), args.game)), "rac1_log.txt")
     if not os.path.exists(p): die("no log yet: it is written when the game runs")
     sys.stdout.write(open(p, errors="replace").read())
 
@@ -454,8 +478,9 @@ def tail(path, n):
 def report(args):
     """one text file with what a bug report needs; nothing from the game, and no file of the user's"""
     c = settings()
-    gdir = os.path.join(HOME, "games", "rac1")
-    bdir = os.path.join(gdir, "build", "linux")
+    g = chosen(c, args.game)
+    gdir = os.path.join(HOME, "games", g["kit"])
+    bdir = out_dir(g)
     out = []
     w = out.append
     w("Project Solana bug report (Linux launcher %s), %s\n" % (VERSION, time.strftime("%Y-%m-%d %H:%M:%S %z")))
@@ -491,8 +516,9 @@ def report(args):
     w("build tools: %s\n" % (open(tv).read().strip() if os.path.exists(tv) else "not downloaded"))
     kv = os.path.join(gdir, "kit_version.txt")
     w("build kit: %s\n" % (open(kv).read().strip() if os.path.exists(kv) else "none"))
+    w("game: %s\n" % g["title"])
     w("game built: %s\n" % ("yes" if os.path.exists(os.path.join(bdir, "rac1_wrapper")) else "no"))
-    iso = c.get("disc", "rac1", fallback="")
+    iso = c.get("disc", g["id"], fallback="")
     w("disc image: %s\n" % ((("found, %.2f GB" % (os.path.getsize(iso) / 1e9)) if os.path.exists(iso) else "MISSING (moved?)") if iso else "none"))
     w("settings:\n")
     for s in c.sections():
@@ -520,6 +546,7 @@ def main():
     b.add_argument("--clean", action="store_true", help="fetch the build kit again and build from scratch")
     b.add_argument("--release-url", default="", help=argparse.SUPPRESS)
     p = sp.add_parser("play", help="play (options are remembered)")
+    p.add_argument("--game", default=None, help="pal or us, when both are built (default: the last one built or played)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--upscaled", dest="resolution", action="store_const", const="upscaled", help="render at about your screen's resolution (default)")
     g.add_argument("--native", dest="resolution", action="store_const", const="native", help="the PS2's own resolution")
@@ -530,8 +557,8 @@ def main():
     v.add_argument("--vsync", dest="vsync", action="store_const", const=1)
     v.add_argument("--no-vsync", dest="vsync", action="store_const", const=0)
     sp.add_parser("status", help="what is installed"); sp.add_parser("desktop", help="add it to the applications menu")
-    sp.add_parser("log", help="print the last game log")
-    sp.add_parser("report", help="write one file with everything a bug report needs")
+    for n, h in (("log", "print the last game log"), ("report", "write one file with everything a bug report needs")):
+        sp.add_parser(n, help=h).add_argument("--game", default=None, help="pal or us")
     a = ap.parse_args()
     if sys.platform != "linux": die("this is the Linux launcher: on Windows, use Project Solana.exe")
     log("project-solana %s: %s" % (VERSION, " ".join(sys.argv[1:])))

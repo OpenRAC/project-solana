@@ -23,6 +23,8 @@ python3 project-solana build ~/Games/ratchet.iso   # once: about 95 MB of downlo
 ./project-solana desktop                     # adds it to the applications menu; from there, Steam > Add a Non-Steam Game
 ```
 
+With both the PAL and the NTSC-U version built, `play` starts the one built or played last; `play --game pal` or `play --game us` picks one (`log` and `report` take `--game` too).
+
 It needs `python3` and the **32-bit** SDL2 and OpenGL libraries. On SteamOS (Steam Deck, Steam Machine) nothing needs installing: the launcher uses the copy of SDL2 that comes with Steam. Elsewhere, `./project-solana status` says what to install for your distribution. Everything is kept in `~/.local/share/project-solana`. On a Steam Deck, run the build once in Desktop Mode (Konsole), then add the game to Steam with `desktop`; it starts full screen there (and on any SteamOS device), with the Deck's controls as the controller.
 
 ### Supported games
@@ -30,7 +32,8 @@ It needs `python3` and the **32-bit** SDL2 and OpenGL libraries. On SteamOS (Ste
 | Game | Region | Disc executable | Status |
 |---|---|---|---|
 | Ratchet & Clank | PAL (v2.00) | `SCES_509.16`, MD5 `d86429e2eca4e1da7d7f1cc656af2574` | Playable start to finish |
-| Ratchet & Clank | NTSC-U, NTSC-J | `SCUS_971.99`, `SCPS_150.37` | Recognised, not supported yet |
+| Ratchet & Clank | NTSC-U | `SCUS_971.99`, MD5 `0c081d4e0353b419d95e5f95eb0ebacb` | New: boots, menus and all 19 levels load; less tested than PAL |
+| Ratchet & Clank | NTSC-J | `SCPS_150.37` | Recognised, not supported yet |
 | Going Commando, Up Your Arsenal, Deadlocked | all | | Recognised, not supported yet |
 
 ### Requirements
@@ -74,7 +77,9 @@ The launcher fetches from the release named after the game (`releases/download/r
 | `toolchain-linux64.zip` | the same for Linux x86-64 (the Linux launcher's) |
 | `rac1-build.zip` | `games/rac1` plus the decomp's source as `decomp/` (no `baserom/`) |
 
-It checks both zips against their SHA-256s, unpacks them next to itself (`toolchain\`, `games\rac1\`), runs `build.py --platform windows --iso <your disc>`, and then deletes the intermediate files (about 1.3 GB) and the bytes it read from the disc, keeping `games\rac1\build\windows` (the game, its saves and logs).
+It checks both zips against their SHA-256s, unpacks them next to itself (`toolchain\`, `games\rac1\`), runs `build.py --platform windows --region pal|us --iso <your disc>`, and then deletes the intermediate files (about 1.3 GB) and the bytes it read from the disc, keeping `games\rac1\build\windows` (PAL) or `games\rac1\build\windows_us` (NTSC-U): the game, its saves and logs. Both versions come from the same kit.
+
+The NTSC-U build is made from the same sources: `tools/region.py` rewrites the decomp and the host engine from PAL addresses into NTSC-U ones with the address map `region/us.json` (functions paired by their code, data by the code that points at it; made by `dev/region_map.py`), and the code itself is translated from the NTSC-U executable and levels. `host/region/us/` holds the little the NTSC-U game needs that PAL's does not.
 
 `solana.ini` `[build]` `release_url=` (a URL or a local folder laid out like the release) and `levels=` override where it fetches from and which levels it builds, for testing.
 

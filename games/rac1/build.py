@@ -25,13 +25,19 @@ ap.add_argument("-j", type=int, default=os.cpu_count() or 2)
 ap.add_argument("-O", default="2")
 ap.add_argument("--iso", default=None)
 ap.add_argument("--levels", default="00")
+ap.add_argument("--region", default="pal", choices=("pal", "us"),
+                help="pal: SCES-50916 (the decomp's own); us: SCUS-97199, made from the same sources by tools/region.py")
 a = ap.parse_args()
+sys.path.insert(0, os.path.join(HERE, "tools"))
+import region as _region
+RC = _region.consts(a.region)
+EXE_NAME = RC["exe"]
 
 zig = [shutil.which("zig")] if shutil.which("zig") else [sys.executable, "-m", "ziglang"]
 # Linux: 32-bit glibc 2.17 or newer (any distribution since 2013), linked dynamically so it can load
 # the system's SDL2 and OpenGL driver (32-bit: i386 libraries)
 target = {"linux": "x86-linux-gnu.2.17", "windows": "x86-windows-gnu"}[a.platform]
-out = os.path.join(HERE, "build", a.platform)
+out = os.path.join(HERE, "build", a.platform if a.region == "pal" else "%s_%s" % (a.platform, a.region))
 gen = os.path.join(out, "gen")
 stage = os.path.join(out, "gen.new")
 obj = os.path.join(out, "obj")
@@ -90,14 +96,22 @@ def iso_file(iso, name):
     return None
 
 
-env = dict(os.environ, UYA_PLATFORM=a.platform, RAC_PLATFORM=a.platform)
+env = dict(os.environ, UYA_PLATFORM=a.platform, RAC_PLATFORM=a.platform, UYA_REGION=a.region)
+# another region: the decomp and the host sources rewritten in its addresses (tools/region.py)
+HOST = os.path.join(HERE, "host")
+if a.region != "pal":
+    rdir = os.path.join(out, "region")
+    subprocess.run([sys.executable, os.path.join(HERE, "tools", "region.py"), a.region, a.repo, rdir], check=True)
+    a.repo = os.path.join(rdir, "repo")
+    HOST = os.path.join(rdir, "host")
+env["UYA_HOST"] = HOST
 # the static recompilation is built from the game itself: the executable comes
 # from the disc image (the decomp repo only lends its symbol and function lists)
 if find_iso():
-    _exe = iso_file(find_iso(), "SCES_509.16")
+    _exe = iso_file(find_iso(), EXE_NAME)
     if _exe:
         os.makedirs(os.path.join(HERE, "build", "disc"), exist_ok=True)
-        _p = os.path.join(HERE, "build", "disc", "SCES_509.16")
+        _p = os.path.join(HERE, "build", "disc", EXE_NAME)
         if not os.path.exists(_p) or open(_p, "rb").read() != _exe: open(_p, "wb").write(_exe)
         env["UYA_EXE"] = _p
         print("executable read from the disc image:", find_iso())
@@ -108,7 +122,7 @@ def progress(phase, i, n):
     print("[progress] %s %d %d" % (phase, i, n), flush=True)
 progress("prepare", 0, 3)
 subprocess.run([py, os.path.join(HERE, "tools", "gen_host.py"), a.repo, stage], check=True, env=env)
-dumps = os.path.join(HERE, "build", "levels")
+dumps = os.path.join(HERE, "build", "levels" if a.region == "pal" else "levels_" + a.region)
 # the level programs first: the executable's translation looks at the core
 # addresses their code calls (tools/recomp.py)
 for lv in levels:
@@ -146,7 +160,7 @@ with open(os.path.join(stage, "level_table.c"), "w") as f:
 sync(stage, gen)
 
 common = ["-target", target, "-O" + a.O, "-g", "-march=nehalem", "-mfpmath=sse", "-malign-double", "-fno-strict-aliasing", "-fwrapv",
-          "-fno-PIE", "-fno-stack-protector", "-I", os.path.join(gen, "include"), "-I", os.path.join(HERE, "host", "include")]
+          "-fno-PIE", "-fno-stack-protector", "-I", os.path.join(gen, "include"), "-I", os.path.join(HOST, "include")]
 if a.platform == "linux": common += ["-D_FILE_OFFSET_BITS=64"]   # (32-bit glibc: disc images are over 2 GB)
 # frontbin code: keep it permissive, it was written for gcc 2.95
 menu_flags = ["-w", "-Wno-error=incompatible-pointer-types", "-Wno-error=int-conversion",
@@ -168,9 +182,9 @@ jobs = []   # (source, extra flags, object name, forced header)
 for c in sorted(glob.glob(os.path.join(gen, "*.c"))):
     jobs.append((c, menu_flags if os.path.basename(c) not in ("tramp_table.c", "level_table.c") else [], None, None))
 jobs.append((os.path.join(gen, "abs_syms.s"), [], None, None))
-for c in sorted(glob.glob(os.path.join(HERE, "host", "overrides", "*.c"))):
+for c in sorted(glob.glob(os.path.join(HOST, "overrides", "*.c"))):
     jobs.append((c, menu_flags, None, None))
-for c in sorted(glob.glob(os.path.join(HERE, "host", "src", "**", "*.c"), recursive=True)):
+for c in sorted(glob.glob(os.path.join(HOST, "src", "**", "*.c"), recursive=True)):
     jobs.append((c, ["-Wall", "-Wno-unused"], None, None))
 for LV, *_ in level_info:
     lg = os.path.join(gen, "l" + LV)
@@ -181,7 +195,7 @@ for LV, *_ in level_info:
     jobs.append((os.path.join(lg, "abs_syms.s"), [], os.path.join("l" + LV, "abs_syms.s.o"), None))
     # the executable's main-segment overrides that the level has: the level's copies
     for nm in open(os.path.join(lg, "overrides.txt")).read().split():
-        c = os.path.join(HERE, "host", "overrides", nm + ".c")
+        c = os.path.join(HOST, "overrides", nm + ".c")
         jobs.append((c, menu_flags + ["-include", hdr], os.path.join("l" + LV, "override_" + nm + ".c.o"), hdr))
 
 
@@ -194,13 +208,13 @@ if not os.path.exists(_stamp) or open(_stamp).read() != _flags:
 flags_time = os.path.getmtime(_stamp)
 
 # headers every generated file sees: a change rebuilds them all
-headers_time = max([flags_time] + [os.path.getmtime(h) for h in glob.glob(os.path.join(gen, "include", "*.h")) + glob.glob(os.path.join(HERE, "host", "include", "*.h"))])
+headers_time = max([flags_time] + [os.path.getmtime(h) for h in glob.glob(os.path.join(gen, "include", "*.h")) + glob.glob(os.path.join(HOST, "include", "*.h"))])
 
 
 def cc(job):
     src, extra, oname, hdr = job
     o = os.path.join(obj, oname or (os.path.basename(src) + ".o"))
-    if os.path.exists(o) and src.endswith(".c") and os.path.join(HERE, "host") not in src:
+    if os.path.exists(o) and src.endswith(".c") and HOST not in src:
         t = os.path.getmtime(o)
         if t > os.path.getmtime(src) and t > headers_time and (not hdr or t > os.path.getmtime(hdr)):
             return o, None

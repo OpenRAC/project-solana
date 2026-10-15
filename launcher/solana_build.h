@@ -363,7 +363,7 @@ static void build_line(const char *l, double f0, double f1)
     else if (!strcmp(ph, "compile")) bld_status(f, L"%ls (%d of %d files)", what, a, b);
     else bld_status(f, L"%ls", what);
 }
-static int run_build(const wchar_t *gdir, const wchar_t *iso, const wchar_t *levels, double f0, double f1)
+static int run_build(const wchar_t *gdir, const wchar_t *iso, const wchar_t *levels, const wchar_t *rgn, double f0, double f1)
 {
     wchar_t py[MAX_PATH], zig[MAX_PATH], tc[MAX_PATH], cmd[4096], logp[MAX_PATH];
     path_join(tc, base_dir, L"toolchain");
@@ -375,7 +375,7 @@ static int run_build(const wchar_t *gdir, const wchar_t *iso, const wchar_t *lev
     int j = (int)si.dwNumberOfProcessors, jm = (int)(ms.ullTotalPhys / (1536ull << 20));
     if (j > jm) j = jm;
     if (j < 1) j = 1;
-    swprintf(cmd, 4096, L"\"%ls\" -u build.py --platform windows --levels %ls --iso \"%ls\" --repo decomp -j %d", py, levels, iso, j);
+    swprintf(cmd, 4096, L"\"%ls\" -u build.py --platform windows --region %ls --levels %ls --iso \"%ls\" --repo decomp -j %d", py, rgn, levels, iso, j);
     static wchar_t path[8192]; static int have_path;   /* (the PATH this program started with) */
     if (!have_path) { DWORD k = GetEnvironmentVariableW(L"PATH", path, 8192); if (k >= 8192) path[0] = 0; have_path = 1; }
     {   /* the toolchain first on PATH; Python in UTF-8 mode (the sources are UTF-8) */
@@ -496,7 +496,8 @@ static DWORD WINAPI build_thread(LPVOID unused)
             GetPrivateProfileStringW(g->kit, L"kit_version", L"", kv, 64, ini_path);
             MultiByteToWideChar(CP_UTF8, 0, version, -1, wv, 64);
             if (kv[0] && wcscmp(kv, wv)) {   /* (none recorded: a first build, or one from before this was kept) */
-                static const wchar_t *old[] = { L"build\\windows\\gen", L"build\\windows\\gen.new", L"build\\windows\\obj", L"zig-cache" };
+                static const wchar_t *old[] = { L"build\\windows\\gen", L"build\\windows\\gen.new", L"build\\windows\\obj",
+                                                L"build\\windows_us\\gen", L"build\\windows_us\\gen.new", L"build\\windows_us\\obj", L"zig-cache" };
                 for (unsigned i = 0; i < sizeof old / sizeof old[0]; i++) { path_join(p, gdir, old[i]); rm_tree(p); }
             }
             WritePrivateProfileStringW(g->kit, L"kit_version", wv, ini_path);
@@ -519,17 +520,20 @@ static DWORD WINAPI build_thread(LPVOID unused)
         GetPrivateProfileStringW(L"build", L"levels", L"", levels, 256, ini_path);
         if (!levels[0]) MultiByteToWideChar(CP_UTF8, 0, lv[0] ? lv : "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18", -1, levels, 256);
         bld_status(0.32, L"Starting the build");
-        if (!run_build(gdir, d->path, levels, 0.32, 0.99)) goto out;
+        if (!run_build(gdir, d->path, levels, g->rgn ? g->rgn : L"pal", 0.32, 0.99)) goto out;
     }
     /* 5. keep what the game needs: the intermediate files (about 1.3 GB) and the bytes read from the disc go */
     bld_status(0.99, L"Cleaning up");
     {
-        static const wchar_t *junk[] = { L"build\\windows\\gen", L"build\\windows\\gen.new", L"build\\windows\\obj", L"build\\levels", L"build\\disc",
-                                         L"build\\windows\\rac1_game.pdb", L"build\\windows\\rac1_wrapper.pdb", L"build\\windows\\asm_stubs.c.lib", L"zig-cache" };
-        for (unsigned i = 0; i < sizeof junk / sizeof junk[0]; i++) { path_join(p, gdir, junk[i]); rm_tree(p); }
+        static const wchar_t *junk[] = { L"gen", L"gen.new", L"obj", L"region", L"rac1_game.pdb", L"rac1_wrapper.pdb", L"asm_stubs.c.lib" };   /* (in the build's own folder) */
+        static const wchar_t *junk2[] = { L"build\\levels", L"build\\levels_us", L"build\\disc", L"zig-cache" };
+        const wchar_t *bd = g->rgn && wcscmp(g->rgn, L"pal") ? L"build\\windows_" : L"build\\windows";
+        for (unsigned i = 0; i < sizeof junk / sizeof junk[0]; i++) {
+            swprintf(p, MAX_PATH, L"%ls\\%ls%ls\\%ls", gdir, bd, g->rgn && wcscmp(g->rgn, L"pal") ? g->rgn : L"", junk[i]); rm_tree(p); }
+        for (unsigned i = 0; i < sizeof junk2 / sizeof junk2[0]; i++) { path_join(p, gdir, junk2[i]); rm_tree(p); }
     }
     {   wchar_t wv[64]; MultiByteToWideChar(CP_UTF8, 0, version, -1, wv, 64);
-        WritePrivateProfileStringW(g->kit, L"built_version", wv, ini_path); }
+        WritePrivateProfileStringW(g->kit, g->rgn ? L"built_version_us" : L"built_version", wv, ini_path); }
     bld_status(1.0, L"Built");
 out:
     free(js);
