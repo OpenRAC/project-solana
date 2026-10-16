@@ -107,6 +107,7 @@ static unsigned long long runs[2], kicks, kick_qw;
 static unsigned long long img_runs[MAX_IMG];
 static u32 *pc_runs[MAX_IMG];             /* runs per start address, for the statistics */
 static const char *cur_name = ""; static u32 cur_pc;
+const char *uya_vu_cur_image(void) { return cur_name; }   /* (the last microprogram run) */
 
 /* Testing: UYA_VUCAPTURE=image,n saves the state (start address, registers,
  * data memory) before and after the n-th run of that image to
@@ -125,6 +126,112 @@ static void capture(const char *path, int vu, u32 pc, const RcVu0 *v)
 }
 
 static void xgkick_flush(void);
+/* testing: UYA_VUCAPSEQ=image,vsync appends every VU1 run of that image during that vsync
+ * to vucapseq.bin: "VCAP", start pc, the state and data memory before, the GIF packets it
+ * kicked (count, then qwords + data each), the state and data memory after. For checking a
+ * native replacement of a microprogram against the program itself (dev/vu_harness). */
+static FILE *seq_f; static int seq_on = -1, seq_kicks; static long seq_kpos; static char seq_img[32]; static unsigned seq_vs;
+static int seq_want(const char *img)
+{
+    if (seq_on < 0) { const char *e = getenv("UYA_VUCAPSEQ"); seq_on = e && sscanf(e, "%31[^,],%u", seq_img, &seq_vs) == 2; }
+    return seq_on > 0 && uya_frame_count() == seq_vs && !strcmp(img, seq_img);
+}
+static void seq_state(const RcVu0 *v)
+{
+    fwrite(v, sizeof *v, 1, seq_f); fwrite((void *)(uintptr_t)0x1100C000u, 1, 0x4000, seq_f);
+    u32 tops[2] = { vu_vif_top(1), vu_vif_itop(1) }; fwrite(tops, 4, 2, seq_f);
+}
+static void seq_begin(u32 pc, const RcVu0 *v)
+{
+    if (!seq_f) seq_f = fopen("vucapseq.bin", "wb");
+    if (!seq_f) return;
+    fwrite("VCAP", 1, 4, seq_f); fwrite(&pc, 4, 1, seq_f); seq_state(v);
+    seq_kicks = 0; seq_kpos = ftell(seq_f); fwrite(&seq_kicks, 4, 1, seq_f);
+}
+static void seq_kick(const u32 *buf, u32 n)
+{
+    if (!seq_f || seq_kpos <= 0) return;
+    fwrite(&n, 4, 1, seq_f); fwrite(buf, 16, n, seq_f); seq_kicks++;
+}
+static void seq_end(const RcVu0 *v)
+{
+    if (!seq_f) return;
+    long here = ftell(seq_f); fseek(seq_f, seq_kpos, SEEK_SET); fwrite(&seq_kicks, 4, 1, seq_f); fseek(seq_f, here, SEEK_SET);
+    seq_kpos = 0; seq_state(v); fflush(seq_f);
+}
+/* Microprograms replaced by native code (host/src/native): the program never runs; the native
+ * code reads what the game unpacked into VU1 data memory and sends the GS what the program sent.
+ * UYA_NATIVE=0 runs the programs instead. */
+#include "../native/native_tie.h"
+#include "../native/native_shrub.h"
+#include "../native/native_tfrag.h"
+#include "../native/native_moby.h"
+void uya_gif_packet(const u32 *data, u32 qwc);
+static const char *native_src = "PATH1 native";
+static void native_emit(const u32 *pk, u32 qwc)
+{
+    extern const char *uya_gs_src; uya_gs_src = native_src;
+    uya_gif_packet(pk, qwc);
+}
+static int native_vu1(const char *img, u32 pc)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("UYA_NATIVE"); on = !e || atoi(e) != 0; if (!on) uya_log("UYA_NATIVE=0: the VU1 programs draw everything"); }
+    if (!on) return 0;
+    const u8 *mem = (const u8 *)(uintptr_t)0x1100C000u;
+    if (img[0] == '5' && !strcmp(img, "56467")) {           /* shrubs */
+        native_src = "PATH1 native shrub";
+        if (native_shrub_run((u8 *)(uintptr_t)0x1100C000u, pc, vu_vif_top(1), native_emit)) return 1;
+        static int told; if (!told++) uya_log("native shrubs: no native code for the program's start 0x%04X (the program runs)", pc);
+        return 0;
+    }
+    if (img[0] == '1' && !strcmp(img, "13859")) {           /* mobys */
+        static int reset;
+        static NativeMobyKicks k;
+        if (!reset++) native_moby_reset();
+        if (native_moby_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), &k) < 0) {
+            static int told; if (!told++) uya_log("native mobys: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        extern const char *uya_gs_src;
+        for (u32 i = 0; i < k.npk; i++) { uya_gs_src = "PATH1 native moby"; uya_gif_packet(k.d + k.off[i] * 4, k.len[i]); }
+        return 1;
+    }
+    if (img[0] == '5' && !strcmp(img, "55907")) {           /* terrain (tfrag) */
+        static int reset;
+        static u32 out[0x4000 * 4];
+        static NativeTfragPacket pk[512];
+        if (!reset++) native_tfrag_reset();
+        int n = native_tfrag_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x4000, pk, 512);
+        if (n < 0) {
+            static int told; if (!told++) uya_log("native tfrag: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        extern const char *uya_gs_src;
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tfrag"; uya_gif_packet(out + pk[i].off * 4, pk[i].n); }
+        return 1;
+    }
+    if (img[0] == '1' && !strcmp(img, "13507")) {           /* ties */
+        switch (pc) {
+        case 0x30: native_tie_setup(mem); return 1;        /* a class packet */
+        case 0x10: case 0x20: case 0x40: return 1;          /* the program's own bookkeeping */
+        case 0x00: {                                        /* an instance */
+            static u32 buf[0x400 * 4];
+            u32 sz = native_tie_size();
+            if (!sz) return 0;
+            extern const char *uya_gs_src;
+            u32 top = vu_vif_top(1), ns = native_tie_state((u8 *)(uintptr_t)0x1100C000u, top, buf);
+            if (ns) { uya_gs_src = "PATH1 native tie"; uya_gif_packet(buf, ns); }
+            memset(buf, 0, sz * 16);
+            u32 n = native_tie_draw(mem, top, buf);
+            uya_gs_src = "PATH1 native tie";
+            if (n) uya_gif_packet(buf, n);
+            return 1;
+        }
+        }
+    }
+    return 0;
+}
 unsigned long long uya_t_vu;
 static void vu_run_(int vu, u32 pc);
 extern int uya_timing;   /* host/src/gs/gs.c: UYA_FPSLOG */
@@ -163,6 +270,36 @@ static void vu_run_(int vu, u32 pc)
         if (vu) xgkick_flush();
         capture("vucap_after.bin", vu, pc, v);
         uya_log("VU capture of image %s run %d (from 0x%04X) saved", wname, want, pc);
+        return;
+    }
+    if (vu) {   /* replaced by native code? (UYA_SRCSTATS: its time as a "native" row, its GS work left out) */
+        extern int uya_srcstats_on(void); extern void uya_srcstat_add(const char *, unsigned long long, unsigned long long, unsigned long long);
+        extern unsigned long long uya_gs_time_in(void);
+        int st = uya_srcstats_on();
+        unsigned long long g0 = st ? uya_gs_time_in() : 0, t0 = st ? __builtin_ia32_rdtsc() : 0;
+        if (native_vu1(vu_images[i].name, pc)) {
+            if (st) { char key[48]; snprintf(key, sizeof key, "native %s@%04X", vu_images[i].name, pc); uya_srcstat_add(key, __builtin_ia32_rdtsc() - t0 - (uya_gs_time_in() - g0), 0, 0); }
+            return;
+        }
+    }
+    {
+        extern int uya_srcstats_on(void); extern void uya_srcstat_add(const char *, unsigned long long, unsigned long long, unsigned long long);
+        if (vu && uya_srcstats_on()) {   /* (UYA_SRCSTATS: the microprogram's own time, its GS work left out) */
+            extern unsigned long long uya_gs_time_in(void);
+            unsigned long long g0 = uya_gs_time_in(), t0 = __builtin_ia32_rdtsc();
+            vu_images[i].fn(v, pc);
+            xgkick_flush();
+            unsigned long long dt = __builtin_ia32_rdtsc() - t0 - (uya_gs_time_in() - g0);
+            char key[48]; snprintf(key, sizeof key, "VU %s@%04X", vu_images[i].name, pc);
+            uya_srcstat_add(key, dt, 0, 0);
+            return;
+        }
+    }
+    if (vu && seq_want(vu_images[i].name)) {   /* UYA_VUCAPSEQ: every run of the image in one vsync */
+        seq_begin(pc, v);
+        vu_images[i].fn(v, pc);
+        xgkick_flush();
+        seq_end(v);
         return;
     }
     vu_images[i].fn(v, pc);
@@ -244,6 +381,7 @@ static void xgkick_send(u32 qaddr)
         *o = 0;
         uya_gs_src = src;
     }
+    seq_kick(buf, n);
     uya_gif_packet(buf, n);
 }
 

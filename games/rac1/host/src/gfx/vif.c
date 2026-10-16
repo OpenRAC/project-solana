@@ -150,6 +150,7 @@ static void unpack(Vif *v, u32 code, const u32 *d, u32 nwords)
     }
 }
 
+extern int uya_vif_log;
 static void start(Vif *v, u32 pc)
 {
     if (v->id) {
@@ -159,6 +160,7 @@ static void start(Vif *v, u32 pc)
     }
     v->itop = v->itops;
     vu_run(v->id, pc);
+    if (uya_vif_log) { extern const char *uya_vu_cur_image(void); uya_log("    (ran image %s from %04X, tops %03X)", uya_vu_cur_image(), pc, v->top); }
 }
 
 static void bad_cmd(Vif *v, u32 code)

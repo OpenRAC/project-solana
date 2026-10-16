@@ -203,12 +203,15 @@ def gen_image(im):
 
     used_q = False
 
-    # ---- branch VI delay: a conditional branch (or JR/JALR) whose VI register
-    # was written by the instruction right before it reads the value the
-    # register had before that write (before the earliest of a run of such
-    # writes, up to 4 back), unless the branch stalls or the write reads flags
-    # (FCAND and friends). This is the hardware's integer pipeline; PCSX2's
-    # microVU models it the same way (analyzeBranchVI). ----
+    # ---- branch VI delay: a conditional branch whose VI register was written
+    # by the instruction right before it reads the value the register had
+    # before that write (before the earliest of a run of such writes, up to 4
+    # back), unless the branch stalls or the write reads flags (FCAND and
+    # friends). This is the hardware's integer pipeline; PCSX2's microVU models
+    # it the same way (analyzeBranchVI, called for conditional branches only).
+    # JR/JALR read the new value (microVU's mVUanalyzeJump has no such delay):
+    # the moby clipper (13859 at 0x22F8) sets vi1 and jumps through it in the
+    # next instruction, and only the new value reaches its edge-going-out code. ----
     FLAGREAD = {"fcand", "fcor", "fceq", "fcget", "fsand", "fsor", "fseq", "fmand", "fmor", "fmeq"}
     def vi_written(lw):
         if lw is None: return 0
@@ -226,7 +229,7 @@ def gen_image(im):
     vib_save, vib_use = {}, {}
     for pc_ in pcs:
         l_ = dec[pc_][1]
-        if l_ is None or l_.name not in ("ibeq", "ibne", "ibltz", "ibgtz", "iblez", "ibgez", "jr", "jalr"): continue
+        if l_ is None or l_.name not in ("ibeq", "ibne", "ibltz", "ibgtz", "iblez", "ibgez"): continue
         if stall[pc_] or pc_ in targets: continue
         regs = [l_.is_ & 15] + ([l_.it & 15] if l_.name in ("ibeq", "ibne") else [])
         for x in regs:

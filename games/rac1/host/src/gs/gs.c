@@ -1502,8 +1502,10 @@ static inline int cmd_same(const pcmd_t *a, const pcmd_t *b)
 static int st_dirty = 1, st_tme;
 static u32 st_epoch;
 static void st_dirty_force(void) { st_dirty = 1; }
+static unsigned long long gs_kicks_drawn;   /* (UYA_SRCSTATS) */
 static void vertex_kick(u32 X, u32 Y, u32 Z, u8 F, int draw)
 {
+    gs_kicks_drawn += draw != 0;
     u64 pr = prmodecont ? prim : ((prim & 7) | (prmode & ~7ull));
     const gs_ctx_t *c = &ctx[BITS(pr, 9, 1)];
     vtx_t v;
@@ -2007,8 +2009,66 @@ static void gs_fifo_put(const void *data, u32 qwc, u32 path)
     }
 }
 
+/* testing: UYA_SRCSTATS=n logs, every n vsyncs, where the GS work comes from: per source (PATH1 by
+ * the VU1 microprogram and its start address, PATH2, PATH3) the GS front end's time, the GIF
+ * qwords, the vertex kicks that drew, and the VU time of each microprogram ("VU" rows).
+ * UYA_DROPSRC="a,b" drops GIF data from sources whose name contains a or b (to see what they draw).
+ * Both with UYA_MTGS=0 (the GS work then runs on the caller's thread). */
+static struct { char key[48]; unsigned long long t, qw, k, n; } srcst[128];
+static int nsrc, srcstats = -1;
+static unsigned long long gs_time_in;
+unsigned long long uya_gs_time_in(void) { return gs_time_in; }
+static const char *dropsrc;
+void uya_srcstat_add(const char *src, unsigned long long t, unsigned long long qw, unsigned long long k)
+{
+    char key[48]; int n = 0;
+    while (src[n] && n < 47 && strncmp(src + n, " kick", 5)) { key[n] = src[n]; n++; }
+    key[n] = 0;
+    int i;
+    for (i = 0; i < nsrc; i++) if (!strcmp(srcst[i].key, key)) break;
+    if (i == nsrc) { if (nsrc == 128) return; strcpy(srcst[nsrc++].key, key); }
+    srcst[i].t += t; srcst[i].qw += qw; srcst[i].k += k; srcst[i].n++;
+}
+int uya_srcstats_on(void) { if (srcstats < 0) { const char *e = getenv("UYA_SRCSTATS"); srcstats = e ? atoi(e) : 0; dropsrc = getenv("UYA_DROPSRC"); } return srcstats > 0; }
+static int src_dropped(const char *src)
+{
+    if (!dropsrc || !*dropsrc) return 0;
+    const char *p = dropsrc;
+    while (*p) {
+        char w[48]; int n = 0;
+        while (*p && *p != ',' && n < 47) w[n++] = *p++;
+        w[n] = 0; if (*p == ',') p++;
+        if (n && strstr(src, w)) return 1;
+    }
+    return 0;
+}
+static void srcstats_log(void)
+{
+    static unsigned long long t0;
+    unsigned long long now = rdtsc_(), tot = 0;
+    for (int i = 0; i < nsrc; i++) tot += srcst[i].t;
+    uya_log("sources over %d vsyncs (rdtsc %llu M total in the rows, %llu M wall):", srcstats, tot >> 20, t0 ? (now - t0) >> 20 : 0);
+    for (int pass = 0; pass < nsrc; pass++) {
+        int b = -1;
+        for (int i = 0; i < nsrc; i++) if (srcst[i].n && (b < 0 || srcst[i].t > srcst[b].t)) b = i;
+        if (b < 0) break;
+        uya_log("  %-34s %6.2f%%  %8llu calls %9llu qw %9llu drawn kicks", srcst[b].key, tot ? 100.0 * srcst[b].t / tot : 0.0,
+                srcst[b].n / srcstats, srcst[b].qw / srcstats, srcst[b].k / srcstats);
+        srcst[b].n = 0;
+    }
+    for (int i = 0; i < nsrc; i++) srcst[i].t = srcst[i].qw = srcst[i].k = srcst[i].n = 0;
+    t0 = now;
+}
 void uya_gs_gif(const u32 *d, u32 qwc)
 {
+    if (uya_srcstats_on() && !mtgs) {
+        if (src_dropped(uya_gs_src)) return;
+        unsigned long long t0 = rdtsc_(), k0 = gs_kicks_drawn;
+        gs_src_int = uya_gs_src; uya_gs_gif_(d, qwc);
+        unsigned long long dt = rdtsc_() - t0; gs_time_in += dt;
+        uya_srcstat_add(uya_gs_src, dt, qwc, gs_kicks_drawn - k0);
+        return;
+    }
     unsigned long long t = timing() ? rdtsc_() : 0;
     if (__builtin_expect(rec_f != 0, 0) && !mtgs) rec_gif(d, qwc, (uya_gs_src[0] == 'P' && uya_gs_src[4] >= '1' && uya_gs_src[4] <= '3') ? (u32)(uya_gs_src[4] - '1') : 2);
     if (!mtgs) { gs_src_int = uya_gs_src; uya_gs_gif_(d, qwc); }
@@ -2293,6 +2353,7 @@ int uya_gs_movie_frame(const u32 *px, int w, int h)
 void uya_gs_vsync(void)
 {
     if (!vram) return;
+    if (uya_srcstats_on() && uya_frame_count() % srcstats == 0) srcstats_log();
     u64 r[6] = { *(volatile u64 *)0x12000000, *(volatile u64 *)0x12000020,
                  *(volatile u64 *)0x12000070, *(volatile u64 *)0x12000080, *(volatile u64 *)0x12000090, *(volatile u64 *)0x120000A0 };
     if (!mtgs) {
