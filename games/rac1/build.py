@@ -14,7 +14,7 @@ build/<platform>/rac1_wrapper.cfg), or from an OpenRAC dump in the decomp
 repo (baserom/overlays/level_NN); they are extracted to build/levels/ and
 never leave your machine.
 """
-import argparse, glob, json, os, shutil, subprocess, sys
+import argparse, glob, json, os, re, shutil, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -157,6 +157,10 @@ with open(os.path.join(stage, "level_table.c"), "w") as f:
                 % (int(LV), entry, ta, tb, LV, LV, LV, LV))
     if not level_info: f.write("    {-1, 0, 0, 0, 0, 0, 0, 0},\n")
     f.write("};\nconst int rac1_level_count = %d;\n" % len(level_info))
+# the code the levels share: translated once (tools/rc_share.py), each level keeping a
+# one-line entry with its own constants
+if len(level_info) > 1 and not os.environ.get("UYA_NOSHARE"):   # UYA_NOSHARE=1: every level keeps its own copies
+    subprocess.run([py, os.path.join(HERE, "tools", "rc_share.py"), stage] + [LV for LV, *_ in level_info], check=True, env=env)
 sync(stage, gen)
 
 common = ["-target", target, "-O" + a.O, "-g", "-march=nehalem", "-mfpmath=sse", "-malign-double", "-fno-strict-aliasing", "-fwrapv",
@@ -178,6 +182,41 @@ menu_flags = ["-w", "-Wno-error=incompatible-pointer-types", "-Wno-error=int-con
               # an aligned load of a misaligned local faults (func_L00_001FE940 on Veldin's
               # first frame): every function realigns its own frame
               "-mstackrealign"]
+def defines_nothing(src):
+    """True when a C file can only declare (externs, prototypes, types, unused static inlines):
+    most of a level's copies of the shared overlay sources are that, their functions being
+    translated from the level's bytes instead, and compiling them gives an empty object.
+    Checked against the objects of a full build (all 2787 level overlay files)."""
+    t = open(src, errors="replace").read()
+    t = re.sub(r"/\*.*?\*/", " ", t, flags=re.S)
+    t = re.sub(r"//[^\n]*", " ", t)
+    t = re.sub(r'"(?:\\.|[^"\\])*"', '""', t)
+    # static inline functions emit nothing on their own: their bodies are left out
+    while True:
+        m = re.search(r"\bstatic\s+(__)?inline(__)?\b[^;{}]*\{", t)
+        if not m: break
+        d, j = 1, m.end()
+        while j < len(t) and d:
+            d += {"{": 1, "}": -1}.get(t[j], 0); j += 1
+        t = t[:m.start()] + ";" + t[j:]
+    # type definitions' braces (struct/union/enum bodies, innermost first) are not code
+    while True:
+        t2 = re.sub(r"\b(struct|union|enum)(\s+\w+)?\s*\{[^{}]*\}", r"\1\2", t)
+        if t2 == t: break
+        t = t2
+    if "{" in t or re.search(r"\bINCLUDE_(ASM|RODATA)\b", t): return False
+    # file-scope statements: each must be a directive, an extern, a typedef or a prototype
+    for st in re.split(r";", re.sub(r"^\s*#[^\n]*", "", t, flags=re.M)):
+        st = " ".join(st.split())
+        if not st: continue
+        if st.startswith(("__asm__", "asm", "__asm")): return False   # file-scope assembly can define symbols
+        if st.startswith(("extern ", "typedef ")): continue
+        if re.fullmatch(r"(struct|union|enum)\s+\w+", st): continue      # a type declared, nothing defined
+        if re.search(r"\w\s*\([^()]*(\([^()]*\)[^()]*)*\)\s*(__attribute__\s*\(\(.*\)\))?\s*$", st) and "=" not in st: continue  # a prototype
+        return False
+    return True
+
+
 jobs = []   # (source, extra flags, object name, forced header)
 for c in sorted(glob.glob(os.path.join(gen, "*.c"))):
     jobs.append((c, menu_flags if os.path.basename(c) not in ("tramp_table.c", "level_table.c") else [], None, None))
@@ -186,11 +225,15 @@ for c in sorted(glob.glob(os.path.join(HOST, "overrides", "*.c"))):
     jobs.append((c, menu_flags, None, None))
 for c in sorted(glob.glob(os.path.join(HOST, "src", "**", "*.c"), recursive=True)):
     jobs.append((c, ["-Wall", "-Wno-unused"], None, None))
+os.makedirs(os.path.join(obj, "shared"), exist_ok=True)
+for c in sorted(glob.glob(os.path.join(gen, "shared", "*.c"))):
+    jobs.append((c, menu_flags, os.path.join("shared", os.path.basename(c) + ".o"), None))
 for LV, *_ in level_info:
     lg = os.path.join(gen, "l" + LV)
     hdr = os.path.join(lg, "l%s_names.h" % LV)
     os.makedirs(os.path.join(obj, "l" + LV), exist_ok=True)
     for c in sorted(glob.glob(os.path.join(lg, "*.c"))):
+        if os.path.basename(c).startswith("overlays_") and defines_nothing(c): continue   # nothing to compile
         jobs.append((c, menu_flags + ["-include", hdr], os.path.join("l" + LV, os.path.basename(c) + ".o"), hdr))
     jobs.append((os.path.join(lg, "abs_syms.s"), [], os.path.join("l" + LV, "abs_syms.s.o"), None))
     # the executable's main-segment overrides that the level has: the level's copies
