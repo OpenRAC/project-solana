@@ -136,16 +136,20 @@ static void kick(Ctx *c, u32 qaddr)
 }
 /* the texture switches' A+D blocks of the packet being drawn (0x0070), for a mesh */
 static int mm_nsw;
-static u32 mm_ad[256][4][4];
-static void mm_switch(Ctx *c, const u32 a0[4])
+static u32 mm_ad[256][8][4]; static int mm_adn[256];
+static void mm_switch(Ctx *c, const u32 a0[4], u32 n)
 {
-    if (mm_nsw >= 256) { mm_nsw = 257; return; }
+    if (mm_nsw >= 256 || n < 1 || n > 8) { mm_nsw = 257; return; }
     memcpy(mm_ad[mm_nsw][0], a0, 16);
-    for (int j = 0; j < 3; j++) memcpy(mm_ad[mm_nsw][1 + j], Q(c->mem, c->vi11 + j), 16);
+    for (u32 j = 1; j < n; j++) memcpy(mm_ad[mm_nsw][j], Q(c->mem, c->vi11 + j - 1), 16);
+    mm_adn[mm_nsw] = (int)n;
     mm_nsw++;
 }
+/* 0x0050: per entry, 1 its vertex has ADC, 2 a clipped triangle ends there (the program drew a fan) */
+static u8 mc_flag[2048]; static int mc_fan;
 static int mm_draw(Ctx *c);
-static unsigned long long mm_n50;   /* (clipping packets: GIF data) */
+static int mm_draw_clip(Ctx *c);
+static unsigned long long mm_n50, mm_n50m;   /* (clipping packets; as meshes) */
 static void rot(Ctx *c) { u32 a = c->vf27[0]; c->vf27[0] = c->vf27[1]; c->vf27[1] = c->vf27[2]; c->vf27[2] = c->vf27[3]; c->vf27[3] = a; }
 static void sq(Ctx *c, u32 a, const u32 *w, int n) { memcpy(Q(c->mem, a), w, 4 * n); }
 
@@ -203,7 +207,7 @@ static void tex_switch(Ctx *c, int s, const float st[3])
         }
     }
     a0[2] = (u32)ftoi(F(a0[2]), 1.0f);
-    if (!c->clipping) mm_switch(c, a0);
+    mm_switch(c, a0, n);
     Q(mem, c->vf29w)[0] = c->vi9;
     if ((s16)(s == 3 ? c->vi7 + 12 : c->vi7) < 0) {
         static const u32 room[2][4] = { { 110, 113, 116, 107 }, { 114, 117, 120, 111 } };
@@ -499,6 +503,7 @@ static int clip_tri(Ctx *c, int e, int s, u32 f1, u32 f14, u32 f13)
     }
     c->vi6 = (c->vi6 - 1) & 0xFFFF;               /* the ST of e is written again after */
     if (n == 0) return 0;
+    mc_fan = 1;
     /* the polygon as a fan, the open strip closed first */
     u32 v15 = (u32)(3 * n);
     c->vi7 = (c->vi7 - 5 - v15) & 0xFFFF;
@@ -579,6 +584,7 @@ static int draw(Ctx *c)
             if ((cl & (culled ? 0x20820u : 0x3FFFFu)) != 0) clipping_now = 1;
         }
         xyz[0] = (u32)ftoi(v->p[0], 16.0f); xyz[1] = (u32)ftoi(v->p[1], 16.0f); xyz[2] = (u32)ftoi(v->p[2], 16.0f); xyz[3] = (u32)ftoi(fw, 16.0f);
+        mc_flag[e] = (i <= 0 || (c->clipping && (culled || clipping_now))) ? 1 : 0;
         if (i == 0) { c->ctr_out = V[e + 3].ctr_after; tex_switch(c, s, v->st); }
         else { u32 st[3] = { U(v->st[0]), U(v->st[1]), U(v->st[2]) }; sq(c, c->vi6, st, 3); c->vi6++; }
         if (clipping_now) {
@@ -606,7 +612,9 @@ static int draw(Ctx *c)
                 memcpy(Q(mem, 992), w992, 16);
                 memcpy(Q(mem, 993), xyz, 16);
                 S.vf12w = (s & 1) ? 0x3F800000u : 0;     /* the slot's parity, for the 3D culling */
+                mc_fan = 0;
                 clip_tri(c, e, s, f1, f14, f13);
+                if (mc_fan) mc_flag[e] |= 2;
                 u32 st[4] = { U(v->st[0]), U(v->st[1]), U(v->st[2]), st_w(c, s) };
                 sq(c, c->vi6, st, 4); c->vi6++;
                 push_clip(vb->cl); push_clip(v->cl);
@@ -670,7 +678,8 @@ int native_moby_run(u32 pc, u8 *mem, u32 top, NativeMobyKicks *k)
     int r = draw(c);
     if (c->clipping) mm_n50++;
     if (r < 0) return -1;
-    if (!c->clipping && mm_draw(c)) k->npk = 0;   /* (drawn as a native mesh: the packets stay in VU memory, unsent) */
+    if (!c->clipping && mm_draw(c)) k->npk = 0;
+    if (c->clipping && mm_draw_clip(c)) { k->npk = 0; mm_n50m++; }   /* (drawn as a native mesh: the packets stay in VU memory, unsent) */
     memcpy(S.vf27, c->vf27, sizeof S.vf27);
     return 0;
 }
@@ -737,7 +746,7 @@ static int mm_draw(Ctx *c)
     u32 sl = (u32)(h >> 50) & (MH - 1);
     int id = -1;
     while (mh_k[sl]) {
-        if (mh_k[sl] == h) { MobyMesh *m = &mmt[mh_v[sl]]; if (m->nv == (u32)nv && !memcmp(m->kind, kind, nv)) { id = mh_v[sl]; break; } }
+        if (mh_k[sl] == h) { MobyMesh *m = &mmt[mh_v[sl]]; if (m->kind && m->nv == (u32)nv && !memcmp(m->kind, kind, nv)) { id = mh_v[sl]; break; } }
         sl = (sl + 1) & (MH - 1);
     }
     if (id < 0) {
@@ -770,9 +779,9 @@ static int mm_draw(Ctx *c)
     u32 pa = 0; u64 pv = prim;
     for (int k = 0; k < m->nseg; k++) {
         if (k > 0) {
-            u32 a[4]; u64 v[4];
-            for (int j = 0; j < 4; j++) { const u32 *q = mm_ad[k - 1][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
-            native_regs(a, v, 4);
+            u32 a[8]; u64 v[8]; int na = mm_adn[k - 1];
+            for (int j = 0; j < na; j++) { const u32 *q = mm_ad[k - 1][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
+            native_regs(a, v, na);
         }
         if (pre) native_regs(&pa, &pv, 1);
         u32 first = m->seg[2 * k], count = m->seg[2 * k + 1];
@@ -795,6 +804,78 @@ static int mm_draw(Ctx *c)
         }
         if (count) native_mesh_draw(MM_ID0 + (u32)id, first, count, xf);
     }
-    if (++mm_n_mesh % 100000 == 0) uya_log("native moby meshes: %u shapes, packets %llu as meshes, %llu as GIF data, %llu clipping packets (GIF data)", nmm, mm_n_mesh, mm_n_pk, mm_n50);
+    if (++mm_n_mesh % 100000 == 0) uya_log("native moby meshes: %u shapes, packets %llu as meshes, %llu as GIF data; clipping packets %llu, %llu as meshes", nmm, mm_n_mesh, mm_n_pk, mm_n50, mm_n50m);
+    return 1;
+}
+
+/* ---- 0x0050 (mobys crossing the screen's edges), with the GPU renderer ----
+ * The program still runs (its decisions are the ones taken); its packets are not sent. The mesh
+ * gets the entries' vertices and the triangles the program drew: strip triangles (no ADC, three
+ * vertices since the strip tag) and the triangles it clipped (drawn whole: the GPU cuts them at
+ * the frustum, the clip scale's planes). Culled triangles are left out. Indices change with
+ * each draw; meshes are kept by entry count. */
+static int mm_draw_clip(Ctx *c)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("UYA_NCLIPMESH"), *n = getenv("UYA_NMOBYMESH"); on = !(e && !atoi(e)) && !(n && !atoi(n)); }
+    if (!on || !uya_gs_renderer_gl()) return 0;
+    u8 *mem = c->mem;
+    int nv = c->end - 3;
+    if (nv < 1 || mm_nsw > 256 || c->proj == 0.0f || c->cscale[2] == 0.0f) { static int t; if (t++ < 3) uya_log("native moby clip meshes: not drawn (entries %d, switches %d, projection %g, clip scale z %g)", nv, mm_nsw, c->proj, c->cscale[2]); return 0; }
+    const u32 *t8 = Q(mem, c->B + 648);
+    int pre = (t8[1] >> 14) & 1; u64 prim = (t8[1] >> 15) & 0x7FF;
+    static float v6[MAXE * 6]; static u8 rgba[MAXE * 4]; static u32 idx[MAXE * 3];
+    static u32 seg[2 * 258];
+    u32 ni = 0; int ns = 1, qn = 0, nsw = 0;
+    seg[0] = 0; seg[1] = 0;
+    for (int e = 0; e < nv; e++) {
+        const Vtx *v = &V[e];
+        float *o = v6 + e * 6;
+        o[0] = v->P[0]; o[1] = v->P[1]; o[2] = v->P[2]; o[3] = v->P[3]; o[4] = v->s0[0]; o[5] = v->s0[1];
+        for (int j = 0; j < 4; j++) rgba[e * 4 + j] = (u8)v->rgba[j];
+        if ((s16)v->idx == 0) { if (ns == 258) return 0; seg[2 * ns] = ni; seg[2 * ns + 1] = 0; ns++; qn = 0; nsw++; }
+        qn++;
+        if ((!(mc_flag[e] & 1) && qn >= 3) || (mc_flag[e] & 2)) {
+            if (e < 2) continue;
+            idx[ni++] = (u32)e - 2; idx[ni++] = (u32)e - 1; idx[ni++] = (u32)e; seg[2 * ns - 1] += 3;
+        }
+    }
+    if (nsw != mm_nsw) { static int t; if (t++ < 3) uya_log("native moby clip meshes: %d switches, %d recorded", nsw, mm_nsw); return 0; }
+    u64 h = (1469598103934665603ull ^ (u64)nv) * 1099511628211ull ^ 0xC11Full;
+    if (!h) h = 1;
+    u32 sl = (u32)(h >> 50) & (MH - 1);
+    int id = -1;
+    while (mh_k[sl]) {
+        if (mh_k[sl] == h && !mmt[mh_v[sl]].kind && mmt[mh_v[sl]].nv == (u32)nv) { id = mh_v[sl]; break; }
+        sl = (sl + 1) & (MH - 1);
+    }
+    if (id < 0) {
+        if (!mmt) mmt = calloc(MM_N, sizeof *mmt);
+        if (nmm == MM_N) { mm_drop(); sl = (u32)(h >> 50) & (MH - 1); }
+        static u32 cap[MAXE * 3];
+        memset(cap, 0, (size_t)nv * 12);
+        MobyMesh *m = &mmt[nmm];
+        m->h = h; m->nv = (u32)nv; m->kind = 0; m->seg = 0; m->nseg = 0;
+        native_mesh_create(MM_ID0 + nmm, v6, rgba, (u32)nv, cap, (u32)nv * 3);
+        while (mh_k[sl]) sl = (sl + 1) & (MH - 1);
+        mh_k[sl] = h; mh_v[sl] = (int)nmm;
+        id = (int)nmm++;
+    }
+    native_mesh_update_idx(MM_ID0 + (u32)id, v6, rgba, (u32)nv, idx, ni);
+    float xf[32] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    xf[16] = c->proj; xf[17] = c->fogmin; xf[18] = 255.0f; xf[19] = c->off[3];
+    xf[20] = c->off[0]; xf[21] = c->off[1]; xf[22] = c->off[2]; xf[23] = -3.4028235e38f;
+    xf[28] = 0.0f; xf[29] = 0.0f; xf[30] = c->cscale[2]; xf[31] = c->cscale[3];   /* (the GPU cuts at the program's clip box: |z| <= w; x y: the screen's edges) */
+    extern const char *uya_gs_src; uya_gs_src = "native moby clip";
+    u32 pa = 0; u64 pv = prim;
+    for (int k = 0; k < ns; k++) {
+        if (k > 0) {
+            u32 a[8]; u64 v[8]; int na = mm_adn[k - 1];
+            for (int j = 0; j < na; j++) { const u32 *q = mm_ad[k - 1][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
+            native_regs(a, v, na);
+        }
+        if (pre) native_regs(&pa, &pv, 1);
+        if (seg[2 * k + 1]) native_mesh_draw(MM_ID0 + (u32)id, seg[2 * k], seg[2 * k + 1], xf);
+    }
     return 1;
 }

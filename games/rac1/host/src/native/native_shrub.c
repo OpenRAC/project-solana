@@ -8,17 +8,19 @@
  * by dev/vu_harness on every shrub run of whole frames). */
 #include "native_shrub.h"
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #include "native_dlist.h"
 static void sm_class(void);
 static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba);
+static void sm_class(void);
 
 static const u32 *Q(const u8 *mem, u32 a) { return (const u32 *)(mem + (a & 0x3FF) * 16); }
 static float fc(float x) { u32 b; memcpy(&b, &x, 4); if ((b & 0x7F800000u) == 0x7F800000u) { b = (b & 0x80000000u) | 0x7F7FFFFFu; memcpy(&x, &b, 4); } return x; }
 static s32 ftoi4(float f) { float x = f * 16.0f; return x >= 2147483647.0f ? 0x7FFFFFFF : x <= -2147483648.0f ? (s32)0x80000000u : (s32)x; }
 static float itof12(s32 i) { return (float)i * (1.0f / 4096.0f); }
 
-static struct {
+typedef struct ShState {
     u32 tag_ad[4];          /* qword 0 at the frame's start: the A+D tag */
     float fogk[4], clamp[4];/* qwords 1 and 2: z, w: fog = row3.w * z + w; clamp: x = max, y = min */
     int have_consts;
@@ -30,7 +32,21 @@ static struct {
     u32 tags[16][4], ad[4][4][4];
     s32 pos[256][4], st[256][4];   /* the class's vertices as the game unpacked them (the program
                                       converts them in place; nothing else reads them) */
-} sh;
+} ShState;
+static ShState sh;
+
+
+/* a class packet at VU memory top into sh */
+static void load_class(const u8 *mem, u32 top)
+{
+    const u32 *h = Q(mem, top);
+    sh.nad = h[0]; sh.nstrip = h[1] < 16 ? h[1] : 16; sh.nvert = h[2] < 256 ? h[2] : 256; sh.voff = h[3];
+    for (u32 s = 0; s < sh.nstrip; s++) memcpy(sh.tags[s], Q(mem, top + 1 + s), 16);
+    if (sh.nad > 4) sh.nad = 4;
+    for (u32 b = 0; b < sh.nad; b++) for (u32 a = 0; a < 4; a++) memcpy(sh.ad[b][a], Q(mem, top + 1 + sh.nstrip + b * 4 + a), 16);
+    for (u32 j = 0; j < sh.nvert; j++) { memcpy(sh.pos[j], Q(mem, top + sh.voff + j), 16); memcpy(sh.st[j], Q(mem, top + sh.voff + h[2] + j), 16); }
+    sh.top = top; sh.valid = 1;
+}
 
 int native_shrub_run(u8 *mem, u32 pc, u32 top, void (*emit)(const u32 *, u32))
 {
@@ -44,13 +60,7 @@ int native_shrub_run(u8 *mem, u32 pc, u32 top, void (*emit)(const u32 *, u32))
         /* the next instance group goes to 238 or 379 (617 minus what is kept at qword 1, y) */
         u32 *g = (u32 *)(mem + 1 * 16);
         g[1] = (g[1] & 0xFFFF0000u) | (pc == 0x0088 ? 379u : 238u);
-        const u32 *h = Q(mem, top);
-        sh.nad = h[0]; sh.nstrip = h[1] < 16 ? h[1] : 16; sh.nvert = h[2] < 256 ? h[2] : 256; sh.voff = h[3];
-        for (u32 s = 0; s < sh.nstrip; s++) memcpy(sh.tags[s], Q(mem, top + 1 + s), 16);
-        if (sh.nad > 4) sh.nad = 4;
-        for (u32 b = 0; b < sh.nad; b++) for (u32 a = 0; a < 4; a++) memcpy(sh.ad[b][a], Q(mem, top + 1 + sh.nstrip + b * 4 + a), 16);
-        for (u32 j = 0; j < sh.nvert; j++) { memcpy(sh.pos[j], Q(mem, top + sh.voff + j), 16); memcpy(sh.st[j], Q(mem, top + sh.voff + h[2] + j), 16); }
-        sh.top = top; sh.valid = 1;
+        load_class(mem, top);
         sm_class();
         sh.bufx = 2064 - sh.bufx - sh.bufy;        /* the buffer neither of the last two used */
         u32 bufs[2] = { sh.bufx, sh.bufy };
@@ -247,25 +257,28 @@ static void sm_class(void)
     sh_k[s] = h; sh_v[s] = (int)nsm;
     sm_cur = (int)nsm++;
 }
-static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba)
+/* an instance as mesh mi: texture blocks ad (the class's), transform R, then screen scale sc and
+ * offset of (clip: the GPU cuts at the near plane) */
+static int sm_draw_x(int sm_cur, const u32 (*ad)[4][4], const float R[4][4], s32 fogi, const u8 *rgba, const float sc[3], const float of[3], int clip)
 {
     if (sm_cur < 0 || !smt[sm_cur].ok || (fogi & 0x8000)) { if (++sm_n_pk % 100000 == 1) uya_log("native shrub meshes: %llu instances as packets (class %d, fog %08X)", sm_n_pk, sm_cur, (u32)fogi); return 0; }
     ShrubMesh *m = &smt[sm_cur];
     u32 id = SM_ID0 + (u32)sm_cur;
     if (memcmp(rgba, m->rgba, m->nv * 4)) { memcpy(m->rgba, rgba, m->nv * 4); native_mesh_colors(id, m->rgba, m->nv); }
     float xf[32];
-    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) xf[r * 4 + k] = R[r][k];
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) xf[r * 4 + k] = k < 3 ? R[r][k] * sc[k] : R[r][k];
     float F = (float)((fogi >> 4) & 0xFF);
     xf[16] = 1.0f; xf[17] = F; xf[18] = F; xf[19] = 0.0f;
-    xf[20] = xf[21] = xf[22] = 0.0f; xf[23] = -3.4028235e38f;   /* (no near limit: these shrubs are inside the view) */
+    xf[20] = of[0]; xf[21] = of[1]; xf[22] = of[2]; xf[23] = -3.4028235e38f;   /* (no near limit: these shrubs are inside the view) */
     xf[24] = xf[25] = xf[26] = xf[27] = 0.0f;
     xf[28] = 0.0f; xf[29] = 0.0f; xf[30] = 1e-30f; xf[31] = 1.0f;   /* (the GPU: no near or far cut but w > 0) */
-    extern const char *uya_gs_src; uya_gs_src = "native shrub";
+    if (clip) { if (sc[2] == 0.0f) return 0; xf[28] = 1.0f; xf[30] = 1.0f / sc[2]; }   /* (the clip program's: z >= -w; x y: the screen's edges) */
+    extern const char *uya_gs_src; uya_gs_src = clip ? "native shrub clip" : "native shrub";
     for (int k = 0; k < m->nop; k++) {
         const SmOp *o = &m->op[k];
         if (o->kind == 0) {
             u32 a[4]; u64 v[4];
-            for (int j = 0; j < 4; j++) { const u32 *q = sh.ad[o->blk][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
+            for (int j = 0; j < 4; j++) { const u32 *q = ad[o->blk][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
             native_regs(a, v, 4);
         } else {
             if (o->pre) { u32 a = 0; u64 v = o->prim; native_regs(&a, &v, 1); }
@@ -273,5 +286,49 @@ static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba)
         }
     }
     if (++sm_n_mesh % 100000 == 0) { u32 bad = 0; for (u32 i = 0; i < nsm; i++) bad += !smt[i].ok; uya_log("native shrub meshes: %u classes (%u as packets), instances %llu as meshes, %llu as packets", nsm, bad, sm_n_mesh, sm_n_pk); }
+    return 1;
+}
+static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba)
+{
+    static const float one[3] = { 1, 1, 1 }, zero[3] = { 0, 0, 0 };
+    return sm_draw_x(sm_cur, (const u32 (*)[4][4])sh.ad, R, fogi, rgba, one, zero, 0);
+}
+
+/* the shrub clip program (912339): its class packets are the main program's (at base); decoded
+ * before the program converts them in place, into a class of their own */
+static ShState csh; static int sm_clip_cur = -1;
+void native_shrub_clip_class(const u8 *mem, u32 base)
+{
+    static ShState keep; int kc = sm_cur;
+    keep = sh;
+    load_class(mem, base); sm_class();
+    csh = sh; sm_clip_cur = sm_cur;
+    sh = keep; sm_cur = kc;
+}
+/* a group of instances (at VU memory grp) as meshes the GPU cuts at the near plane; c22, c23: the
+ * screen scale and offset, c29 the fog clamp, c30 z w the fog scale and offset. 1: all drawn */
+int native_shrub_clip_group(const u8 *mem, u32 grp, const float c22[4], const float c23[4], const float c29[4], const float c30[4])
+{
+    if (sm_clip_cur < 0 || !smt[sm_clip_cur].ok || !csh.valid) { static int t; if (t++ < 3) uya_log("native shrub clip meshes: no class mesh (valid %d, mesh %d)", csh.valid, sm_clip_cur); return 0; }
+    u32 n = Q(mem, grp)[0];
+    if (n > 8) return 0;
+    static u8 rgba[8][256 * 4]; float R[8][4][4]; s32 fogi[8];
+    for (u32 i = 0; i < n; i++) {
+        u32 base = grp + 1 + i * 28, cols = base + 4;
+        for (int k = 0; k < 4; k++) memcpy(R[i][k], Q(mem, base + k), 16);
+        float fog = fc(fc(R[i][3][3] * c30[2]) + c30[3]);
+        fog = fmaxf(fog, c29[0]); fog = fminf(fog, c29[1]);
+        fogi[i] = ftoi4(fog);
+        if (fogi[i] & 0x8000) return 0;
+        u32 alpha = Q(mem, cols)[3];
+        int quirk = csh.nvert > 3 && (csh.st[2][3] & 0x8000);
+        for (u32 j = 0; j < csh.nvert; j++) {
+            u32 ci = ((u32)csh.st[j][3] & 0x7FFF) + cols;
+            if (quirk && j == 3) ci += cols;
+            const u32 *c = Q(mem, ci);
+            u8 *o = rgba[i] + j * 4; o[0] = (u8)c[0]; o[1] = (u8)c[1]; o[2] = (u8)c[2]; o[3] = (u8)alpha;
+        }
+    }
+    for (u32 i = 0; i < n; i++) sm_draw_x(sm_clip_cur, (const u32 (*)[4][4])csh.ad, (const float (*)[4])R[i], fogi[i], rgba[i], c22, c23, 1);
     return 1;
 }

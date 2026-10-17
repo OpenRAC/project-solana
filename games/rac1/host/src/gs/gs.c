@@ -2428,6 +2428,14 @@ static void gs_mesh_update(u32 id, const float *v6, const u8 *rgba, u32 nv)
     if (v6) memcpy(gsmesh[id].v6, v6, (size_t)nv * 24);
     if (gsgl_on && gsmesh[id].gl >= 0) gsgl_mesh_update(gsmesh[id].gl, v6, rgba);
 }
+/* new vertices, colours and triangle indices (ni: no more than the mesh was made with) */
+static void gs_mesh_update_idx(u32 id, const float *v6, const u8 *rgba, u32 nv, const u32 *idx, u32 ni)
+{
+    if (id >= GSMESH_N || !gsmesh[id].v6 || nv != gsmesh[id].nv || ni > gsmesh[id].ni) return;
+    gs_mesh_update(id, v6, rgba, nv);
+    memcpy(gsmesh[id].idx, idx, (size_t)ni * 4);
+    if (gsgl_on && gsmesh[id].gl >= 0 && ni) gsgl_mesh_index(gsmesh[id].gl, idx, (int)ni);
+}
 static void rec_meshes(void)
 {
     for (u32 id = 0; id < GSMESH_N; id++) {
@@ -2541,6 +2549,12 @@ static void gs_dlist_(const u32 *d, u32 qwc)
             u32 nvx = c[2], q6 = (nvx * 6 + 3) / 4;
             gs_mesh_update(c[1], (const float *)(c + 4), (const u8 *)(c + 4 + q6 * 4), nvx);
             q += 1 + q6 + (nvx + 3) / 4;
+        } break;
+        case 9: {   /* new vertices, colours and indices for mesh id: {9, id, nv, ni} + nv * (x y z w s t) + nv rgba + ni indices */
+            u32 nvx = c[2], ni = c[3], q6 = (nvx * 6 + 3) / 4, qc = (nvx + 3) / 4;
+            const u32 *v = c + 4;
+            gs_mesh_update_idx(c[1], (const float *)v, (const u8 *)(v + q6 * 4), nvx, v + (q6 + qc) * 4, ni);
+            q += 1 + q6 + qc + (ni + 3) / 4;
         } break;
         case 6: gs_mesh_free(c[1]); q++; break;
         case 7: {   /* draw indices [first, first + count) of mesh id: {7, id, first, count} + 8 qwords of transform */

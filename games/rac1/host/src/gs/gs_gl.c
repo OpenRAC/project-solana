@@ -1521,6 +1521,16 @@ void gsgl_mesh_update(int id, const float *v6, const u8 *rgba)
     p_glBindBuffer(GL_ARRAY_BUFFER, nmesh[id].cb);
     p_glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)nmesh[id].nv * 4, rgba);
 }
+/* new triangle indices for mesh id (the first ni; no more than it was made with) */
+void gsgl_mesh_index(int id, const u32 *idx, int ni)
+{
+    if (id < 0 || id >= NMESH || !nmesh[id].used || ni <= 0 || ni > nmesh[id].ni) return;
+    gsgl_flush();
+    p_glBindVertexArray(nmesh[id].vao); gc.prog = 0;
+    p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, nmesh[id].ib);
+    p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)ni * 4, idx);
+    p_glBindVertexArray(vao);
+}
 void gsgl_mesh_free(int id)
 {
     if (id < 0 || id >= NMESH) return;
@@ -1546,11 +1556,20 @@ void gsgl_mesh_draw(const pcmd_t *S, u32 sti, int id, int first, int count, cons
     if (S->tme && S->defer && !S->rt) { clut_snap(0); b_clut_saved = 1; }
     flush_t fx;
     if (!flush_setup(&bs, &fx)) { gsgl_batch_id++; return; }
-    p_glUseProgram(prog_n); p_glBindVertexArray(nmesh[id].vao); gc.prog = prog_n;
-    p_glUniform4f(un_vp, 2.0f / (float)fx.ct->w, 2.0f / (float)TGH, 0.5f - 1.0f / 128.0f, (float)sc);
-    p_glUniform4fv(un_m, 4, xf);
-    p_glUniform4fv(un_k, 1, xf + 16); p_glUniform4fv(un_o, 1, xf + 20); p_glUniform4fv(un_x, 1, xf + 24); p_glUniform4fv(un_c, 1, xf + 28);
-    p_glUniform4iv(un_i, 10, fx.U);
+    if (gc.prog != prog_n) { p_glUseProgram(prog_n); gc.prog = prog_n; }
+    p_glBindVertexArray(nmesh[id].vao);
+    /* (the program's uniforms keep their values: only those that changed since the last mesh draw are sent) */
+    static float l_vp[4], l_xf[32]; static int l_U[40], l_ok;
+    float vp[4] = { 2.0f / (float)fx.ct->w, 2.0f / (float)TGH, 0.5f - 1.0f / 128.0f, (float)sc };
+    if (!l_ok || memcmp(vp, l_vp, sizeof vp)) { p_glUniform4f(un_vp, vp[0], vp[1], vp[2], vp[3]); memcpy(l_vp, vp, sizeof vp); }
+    if (!l_ok || memcmp(xf, l_xf, 16 * 4)) p_glUniform4fv(un_m, 4, xf);
+    if (!l_ok || memcmp(xf + 16, l_xf + 16, 16)) p_glUniform4fv(un_k, 1, xf + 16);
+    if (!l_ok || memcmp(xf + 20, l_xf + 20, 16)) p_glUniform4fv(un_o, 1, xf + 20);
+    if (!l_ok || memcmp(xf + 24, l_xf + 24, 16)) p_glUniform4fv(un_x, 1, xf + 24);
+    if (!l_ok || memcmp(xf + 28, l_xf + 28, 16)) p_glUniform4fv(un_c, 1, xf + 28);
+    memcpy(l_xf, xf, sizeof l_xf);
+    if (!l_ok || memcmp(fx.U, l_U, sizeof l_U)) { p_glUniform4iv(un_i, 10, fx.U); memcpy(l_U, fx.U, sizeof l_U); }
+    l_ok = 1;
     for (int k = 0; k < fx.np; k++) {
         p_glUniform1i(un_apass, fx.ps[k].apass);
         if (gc.cmask != fx.ps[k].cm) { p_glColorMask(fx.ps[k].cm & 1, (fx.ps[k].cm >> 1) & 1, (fx.ps[k].cm >> 2) & 1, (fx.ps[k].cm >> 3) & 1); gc.cmask = fx.ps[k].cm; }
@@ -1598,9 +1617,10 @@ static const char *nvs_src =
     /* clip w is 1/Q, so what the GS interpolates on the screen (STQ, then S/Q per pixel; colour,
      * Z, fog) is had with perspective: s t, and colour Z fog times 1/Q (the pixel stage multiplies
      * by Q again). Cut by the GPU at the screen's edges, and at the near and far planes: those of
-     * the frustum (|z u_c.z| <= |w u_c.w|) when u_c.z is given, else 1/Q < u_o.w is out (the CPU form
+     * the frustum (|z u_c.z| <= |w u_c.w|; with u_c.x set, only z u_c.z >= -|w u_c.w|) when u_c.z is given, else 1/Q < u_o.w is out (the CPU form
      * drops those triangles). */
     "  float zc = u_c.z != 0.0 ? P.z * u_c.z / abs(u_k.x * u_c.w) : W - 2.0 * u_o.w;\n"
+    "  if (u_c.x != 0.0) zc = (zc + W) * 1e-6 - W;\n"   /* (u_c.x: the near plane only, |z u_c.z| >= -|w u_c.w|) */
     "  gl_Position = vec4(nd * W, zc, W);\n"
     "  v_rec = 0; v_fcol = a_col; v_div = 1.0; v_zr = 0u;\n"
     "  m_col = a_col * W;\n"

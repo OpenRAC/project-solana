@@ -170,6 +170,8 @@ static void seq_end(const RcVu0 *v)
 #include "../native/native_tfragclip.h"
 #include "../native/native_shrubclip.h"
 #include "../native/native_tieclip.h"
+#include "../native/native_fx221571.h"
+#include "../native/native_fx57843.h"
 void uya_gif_packet(const u32 *data, u32 qwc);
 static const char *native_src = "PATH1 native";
 static void native_emit(const u32 *pk, u32 qwc)
@@ -177,6 +179,29 @@ static void native_emit(const u32 *pk, u32 qwc)
     extern const char *uya_gs_src; uya_gs_src = native_src;
     native_kick(pk, qwc);
 }
+/* the clip programs' instances as meshes the GPU cuts (GPU renderer only; UYA_NCLIPMESH=0: off) */
+static unsigned long long clip_n[3][2];   /* (tie, shrub runs: as meshes, not) */
+static void clip_count(int k, int mesh)
+{
+    clip_n[k][mesh ? 0 : 1]++;
+    if ((clip_n[0][0] + clip_n[0][1] + clip_n[1][0] + clip_n[1][1]) % 20000 == 0)
+        uya_log("clip programs as meshes: tie %llu of %llu, shrub groups %llu of %llu", clip_n[0][0], clip_n[0][0] + clip_n[0][1], clip_n[1][0], clip_n[1][0] + clip_n[1][1]);
+}
+static int clip_meshes(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("UYA_NCLIPMESH"); on = !(e && !atoi(e)); }
+    { static int told; if (told++ < 1) uya_log("clip programs as meshes: switch %d, GPU renderer %d", on, uya_gs_renderer_gl()); }
+    return on && uya_gs_renderer_gl();
+}
+/* the two effect programs as native code (UYA_NFX: 0 the translated programs; bits 1 221571, 2 57843) */
+static int fx_native(int bit)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("UYA_NFX"); on = e ? atoi(e) : 3; }
+    return (on & bit) != 0;
+}
+static void drop_emit(const u32 *pk, u32 qwc) { (void)pk; (void)qwc; }
 static int native_vu1(const char *img, u32 pc)
 {
     static int on = -1;
@@ -211,6 +236,11 @@ static int native_vu1(const char *img, u32 pc)
         memcpy(r.vf29, rc_vu1.vf[29], 16); memcpy(r.vf30, rc_vu1.vf[30], 16); memcpy(r.vf31, rc_vu1.vf[31], 16);
         memcpy(&r.vf1w, &rc_vu1.vf[1][3], 4); memcpy(&r.vf25w, &rc_vu1.vf[25][3], 4); memcpy(&r.vf26w, &rc_vu1.vf[26][3], 4);
         native_tieclip_seed(&r);
+        /* with the GPU renderer: the instance as its class's mesh, cut by the GPU at the frustum
+         * (the program still runs: later runs read what it leaves; its packets are not sent) */
+        int as_mesh = 0;
+        if (pc == 0x30) native_tie_clip_class(mem);
+        else if (pc == 0x00) { if (clip_meshes()) as_mesh = native_tie_clip_mesh(mem, r.vf22[0] & 0xFFFF); clip_count(0, as_mesh); }
         int n = native_tieclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x4000, pk, 1024);
         if (n < 0) {
             static int told; if (!told++) uya_log("native tie clip: no native code for the program's start 0x%04X (the program runs)", pc);
@@ -222,14 +252,24 @@ static int native_vu1(const char *img, u32 pc)
         memcpy(rc_vu1.vf[29], r.vf29, 16); memcpy(rc_vu1.vf[30], r.vf30, 16); memcpy(rc_vu1.vf[31], r.vf31, 16);
         memcpy(&rc_vu1.vf[1][3], &r.vf1w, 4); memcpy(&rc_vu1.vf[25][3], &r.vf25w, 4);
         extern const char *uya_gs_src;
-        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tie clip"; native_kick(out + pk[i].off * 4, pk[i].n); }
+        if (!as_mesh) for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tie clip"; native_kick(out + pk[i].off * 4, pk[i].n); }
         return 1;
     }
     if (img[0] == '9' && !strcmp(img, "912339")) {          /* shrubs crossing the view frustum (shrub clip) */
         /* the registers it carries from run to run are the VU1's (other programs share them) */
         native_shrubclip_seed((const u32 (*)[4])rc_vu1.vf, rc_vu1.vi);
         native_src = "PATH1 native shrub clip";
-        if (native_shrubclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), native_emit) < 0) {
+        /* with the GPU renderer: the instances as their class's mesh, cut by the GPU (the program
+         * still runs: later runs read what it leaves; its packets are not sent) */
+        int as_mesh = 0;
+        if (pc == 0x0088 || pc == 0x00A8) native_shrub_clip_class(mem, (122 - rc_vu1.vi[11]) & 0xFFFF);
+        else if (pc == 0x0318 && clip_meshes()) {
+            float c22[4], c23[4], c29[4], c30[4];
+            memcpy(c22, rc_vu1.vf[22], 16); memcpy(c23, rc_vu1.vf[23], 16); memcpy(c29, rc_vu1.vf[29], 16); memcpy(c30, rc_vu1.vf[30], 16);
+            as_mesh = native_shrub_clip_group(mem, (617 - (((const u32 *)(mem + 16))[1] & 0xFFFF)) & 0xFFFF, c22, c23, c29, c30);
+        }
+        if (pc == 0x0318) clip_count(1, as_mesh);
+        if (native_shrubclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), as_mesh ? drop_emit : native_emit) < 0) {
             static int told; if (!told++) uya_log("native shrub clip: no native code for the program's start 0x%04X (the program runs)", pc);
             return 0;
         }
@@ -269,6 +309,40 @@ static int native_vu1(const char *img, u32 pc)
         }
         extern const char *uya_gs_src;
         for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tfrag"; native_kick(out + pk[i].off * 4, pk[i].n); }
+        return 1;
+    }
+    if (img[0] == '5' && !strcmp(img, "57843") && fx_native(2)) {   /* an effect's triangle strips (with a clipper) */
+        static u32 out[0x8000 * 4];
+        static NativeFx57843Packet pk[2048];
+        NativeFx57843Regs r;   /* the whole VU1 register file (other programs read what it leaves) */
+        native_fx57843_regs_from_vu(&r, &rc_vu1);
+        native_fx57843_seed(&r);
+        int n = native_fx57843_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x8000, pk, 2048);
+        if (n < 0) {
+            static int told; if (!told++) uya_log("native fx 57843: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        native_fx57843_state(&r);
+        native_fx57843_regs_to_vu(&r, &rc_vu1);
+        extern const char *uya_gs_src;
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native fx 57843"; native_kick(out + pk[i].off * 4, pk[i].n); }
+        return 1;
+    }
+    if (img[0] == '2' && !strcmp(img, "221571") && fx_native(1)) {   /* glints, sparkles, streaks (an effect) */
+        static u32 out[0x400 * 4];
+        static NativeFx221571Packet pk[4];
+        NativeFx221571Regs r;   /* the whole VU1 register file (other programs read what it leaves) */
+        native_fx221571_regs_from_vu(&r, &rc_vu1);
+        native_fx221571_seed(&r);
+        int n = native_fx221571_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x400, pk, 4);
+        if (n < 0) {
+            static int told; if (!told++) uya_log("native fx 221571: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        native_fx221571_state(&r);
+        native_fx221571_regs_to_vu(&r, &rc_vu1);
+        extern const char *uya_gs_src;
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native fx 221571"; native_kick(out + pk[i].off * 4, pk[i].n); }
         return 1;
     }
     if (img[0] == '1' && !strcmp(img, "13507")) {           /* ties */

@@ -26,6 +26,7 @@ void gsgl_flush(void);                    /* draw the batched primitives */
  * per vertex, triangle indices. -1: not available. */
 int  gsgl_mesh_create(const float *v6, const u8 *rgba, int nv, const u32 *idx, int ni);
 void gsgl_mesh_update(int id, const float *v6, const u8 *rgba);   /* (v6 0: the colours only) */
+void gsgl_mesh_index(int id, const u32 *idx, int ni);   /* (new indices: no more than the mesh was made with) */
 void gsgl_mesh_free(int id);
 /* xf: rows 0..3 of the matrix (16 floats); Q numerator, fog min, fog max, fog offset; screen
  * offset x y z and the near limit; XYOFFSET x y in pixels, texture width and height; the

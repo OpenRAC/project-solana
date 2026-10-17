@@ -120,6 +120,16 @@ void native_mesh_update(u32 id, const float *v6, const u8 *rgba, u32 nv)
     memcpy(b + 4 + q6 * 4, rgba, (size_t)nv * 4);
     uya_gs_dlist(b, n);
 }
+void native_mesh_update_idx(u32 id, const float *v6, const u8 *rgba, u32 nv, const u32 *idx, u32 ni)
+{
+    u32 q6 = (nv * 6 + 3) / 4, qc = (nv + 3) / 4, qi = (ni + 3) / 4, n = 1 + q6 + qc + qi;
+    u32 *b = mroom(n);
+    b[0] = 9; b[1] = id; b[2] = nv; b[3] = ni;
+    memcpy(b + 4, v6, (size_t)nv * 24);
+    memcpy(b + 4 + q6 * 4, rgba, (size_t)nv * 4);
+    memcpy(b + 4 + (q6 + qc) * 4, idx, (size_t)ni * 4);
+    uya_gs_dlist(b, n);
+}
 void native_mesh_free(u32 id)
 {
     u32 b[4] = { 6, id, 0, 0 };

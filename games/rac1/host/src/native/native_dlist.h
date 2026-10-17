@@ -11,6 +11,8 @@ void native_kick(const u32 *pk, u32 qwc);
 void native_mesh_create(u32 id, const float *v6, const u8 *rgba, u32 nv, const u32 *idx, u32 ni);
 void native_mesh_colors(u32 id, const u8 *rgba, u32 nv);
 void native_mesh_update(u32 id, const float *v6, const u8 *rgba, u32 nv);   /* new vertices and colours */
+/* new vertices, colours and the first ni triangle indices (no more than the mesh was made with) */
+void native_mesh_update_idx(u32 id, const float *v6, const u8 *rgba, u32 nv, const u32 *idx, u32 ni);
 void native_mesh_free(u32 id);
 /* GS register writes (the material: TEX0, TEX1, CLAMP, ALPHA, TEST... and PRIM), as {addr, value} */
 void native_regs(const u32 *addr, const u64 *val, int n);

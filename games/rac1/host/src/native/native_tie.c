@@ -302,16 +302,18 @@ static void tm_class(void)
     tm_cur = (int)ntm++;
 }
 
-int native_tie_mesh(const u8 *mem, u32 top)
+/* an instance at VU memory inst (rows 0..5, colour indexes at inst + 6) of class c (mesh mi);
+ * sc, of: the screen scale and offset after the projection (clip: 0 none; 1 the frustum) */
+static int tm_draw(TieClass *c, int mi, const u8 *mem, u32 inst, const float sc[3], const float of[3], int clip)
 {
-    if (tm_cur < 0 || !tm[tm_cur].ok) { tm_n_pk++; return 0; }
-    TieMesh *m = &tm[tm_cur]; TieClass *c = &cls;
+    if (mi < 0 || !tm[mi].ok) { tm_n_pk++; return 0; }
+    TieMesh *m = &tm[mi]; int tm_cur = mi;
     float R[6][4];
-    for (int k = 0; k < 6; k++) memcpy(R[k], Q(mem, 0xC6 + top + k), 16);
+    for (int k = 0; k < 6; k++) memcpy(R[k], Q(mem, inst + k), 16);
     s32 fog = ftoi4(R[5][3]);
-    if (fog & 0x8000) { if (++tm_n_pk % 10000 == 1) uya_log("native tie meshes: an instance as a packet (fog %08X)", (u32)fog); return 0; }      /* (the ADC bit: the packet's vertices would not draw) */
+    if (fog & 0x8000) { if (clip) { static int t; if (t++ < 3) uya_log("native tie clip meshes: fog %08X", (u32)fog); } if (++tm_n_pk % 10000 == 1) uya_log("native tie meshes: an instance as a packet (fog %08X)", (u32)fog); return 0; }      /* (the ADC bit: the packet's vertices would not draw) */
     static float v6[384 * 6]; static u8 rgba[384 * 4];
-    const u32 *idx = Q(mem, 0xCC + top);
+    const u32 *idx = Q(mem, inst + 6);
     for (int j = 0; j < c->ndinky; j++) { const u32 *col = Q(mem, 838 + idx[j]); for (int k = 0; k < 4; k++) rgba[j * 4 + k] = (u8)col[k]; }
     u32 fq = (c->ndinky + 3) / 4;
     int moved = 0;
@@ -322,7 +324,7 @@ int native_tie_mesh(const u8 *mem, u32 top)
         o[0] = fc(fc((float)v->a[0] * R[4][0]) + (float)v->b[0]);
         o[1] = fc(fc((float)v->a[1] * R[4][0]) + (float)v->b[1]);
         o[2] = fc(fc((float)v->a[2] * R[4][0]) + (float)v->b[2]);
-        const u32 *iq = Q(mem, 0xCC + top + fq + j);
+        const u32 *iq = Q(mem, inst + 6 + fq + j);
         const float *c0 = (const float *)Q(mem, 838 + iq[0]), *c1 = (const float *)Q(mem, 838 + iq[1]), *c2 = (const float *)Q(mem, 838 + iq[2]);
         for (int k = 0; k < 4; k++) {
             float mm = fc(fc(c2[k] * 0.5f) + fc(c1[k] * 0.5f));
@@ -334,13 +336,14 @@ int native_tie_mesh(const u8 *mem, u32 top)
     if (moved) { memcpy(m->v6, v6, m->nv * 24); memcpy(m->rgba, rgba, m->nv * 4); native_mesh_update(TM_ID0 + (u32)tm_cur, m->v6, m->rgba, m->nv); tm_n_up++; }
     else if (memcmp(rgba, m->rgba, m->nv * 4)) { memcpy(m->rgba, rgba, m->nv * 4); native_mesh_colors(TM_ID0 + (u32)tm_cur, m->rgba, m->nv); tm_n_up++; }
     float xf[32];
-    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) xf[r * 4 + k] = R[r][k];
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) xf[r * 4 + k] = k < 3 ? R[r][k] * sc[k] : R[r][k];
     float F = (float)((fog >> 4) & 0xFF);
     xf[16] = 1.0f; xf[17] = F; xf[18] = F; xf[19] = 0.0f;
-    xf[20] = xf[21] = xf[22] = 0.0f; xf[23] = -3.4028235e38f;   /* (no near limit: the instances here are inside the view) */
+    xf[20] = of[0]; xf[21] = of[1]; xf[22] = of[2]; xf[23] = -3.4028235e38f;   /* (no near limit on the CPU: the main program's instances are inside the view) */
     xf[24] = xf[25] = xf[26] = xf[27] = 0.0f;
     xf[28] = 0.0f; xf[29] = 0.0f; xf[30] = 1e-30f; xf[31] = 1.0f;   /* (the GPU: no near or far cut but w > 0) */
-    extern const char *uya_gs_src; uya_gs_src = "native tie";
+    if (clip) { if (sc[2] == 0.0f) { static int t; if (t++ < 3) uya_log("native tie clip meshes: screen scale %g %g %g", sc[0], sc[1], sc[2]); return 0; } xf[30] = 1.0f / sc[2]; }   /* (the clip program's box: |z| <= w; x y: the screen's edges) */
+    extern const char *uya_gs_src; uya_gs_src = clip ? "native tie clip" : "native tie";
     for (int k = 0; k < m->nr; k++) {
         const TmRange *r = &m->r[k];
         u32 a[6]; u64 v[6]; int n = 0;
@@ -351,4 +354,29 @@ int native_tie_mesh(const u8 *mem, u32 top)
     }
     if (++tm_n_mesh % 200000 == 0) { u32 bad = 0; for (u32 i = 0; i < ntm; i++) bad += !tm[i].ok; uya_log("native tie meshes: %u classes (%u as packets), instances %llu as meshes, %llu as packets, %llu mesh updates", ntm, bad, tm_n_mesh, tm_n_pk, tm_n_up); }
     return 1;
+}
+
+int native_tie_mesh(const u8 *mem, u32 top)
+{
+    static const float one[3] = { 1, 1, 1 }, zero[3] = { 0, 0, 0 };
+    return tm_draw(&cls, tm_cur, mem, 0xC6 + top, one, zero, 0);
+}
+
+/* the tie clip program (224979): its class packets are the main program's; decoded here before
+ * the program converts them in place, into a class of their own (the main program's is kept) */
+static TieClass ccls; static int tm_clip_cur = -1;
+void native_tie_clip_class(const u8 *mem)
+{
+    static TieClass keep; int keep_cur = tm_cur;
+    keep = cls;
+    native_tie_setup(mem);
+    ccls = cls; tm_clip_cur = tm_cur;
+    cls = keep; tm_cur = keep_cur;
+}
+int native_tie_clip_mesh(const u8 *mem, u32 inst)
+{
+    if (!ccls.valid || tm_clip_cur < 0 || !tm[tm_clip_cur].ok) { static int t; if (t++ < 3) uya_log("native tie clip meshes: no class mesh (valid %d, mesh %d)", ccls.valid, tm_clip_cur); return 0; }
+    float sc[4], of[4];
+    memcpy(sc, Q(mem, 974), 16); memcpy(of, Q(mem, 973), 16);
+    return tm_draw(&ccls, tm_clip_cur, mem, inst, sc, of, 1);
 }

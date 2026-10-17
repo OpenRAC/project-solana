@@ -11,4 +11,8 @@ u32 native_tie_size(void);
 u32 native_tie_state(u8 *mem, u32 top, u32 *out);   /* the current class's packet length in qwords */
 /* an instance drawn as its class's native mesh (1), or not (0: send the packet) */
 int native_tie_mesh(const u8 *vumem, u32 top);
+/* the tie clip program (224979), drawn by the GPU renderer as meshes cut at the frustum: a class
+ * packet (before the program's own start 0x30), an instance at VU memory inst (1: drawn) */
+void native_tie_clip_class(const u8 *vumem);
+int native_tie_clip_mesh(const u8 *vumem, u32 inst);
 #endif
