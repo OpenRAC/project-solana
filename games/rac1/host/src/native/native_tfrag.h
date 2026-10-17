@@ -17,4 +17,10 @@ void native_tfrag_state(u32 buf[4], float cscale[4]);
  * in order, are copied to out (at most out_cap qwords in all) and listed in pk (at most maxpk).
  * Returns the number of packets, or -1 for a start this file does not know. */
 int native_tfrag_run(u32 pc, u8 *mem, u32 top, u32 *out, u32 out_cap, NativeTfragPacket *pk, int maxpk);
+/* for native_terrain.c: a LOD start's (0x40, 0x50, 0x70, 0x80) transform, morphs and collapses
+ * of the packet at top in mem, without its strips (-1: another start); the colour scale the
+ * next LOD start uses (the program's vf4), and setting it as a run of the program would */
+int native_tfrag_lod_vertices(u32 pc, u8 *mem, u32 top);
+void native_tfrag_cscale(float c[4]);
+void native_tfrag_set_cscale(const float c[4]);
 #endif

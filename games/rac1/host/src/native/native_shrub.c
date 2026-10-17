@@ -8,6 +8,10 @@
  * by dev/vu_harness on every shrub run of whole frames). */
 #include "native_shrub.h"
 #include <string.h>
+#include <stdlib.h>
+#include "native_dlist.h"
+static void sm_class(void);
+static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba);
 
 static const u32 *Q(const u8 *mem, u32 a) { return (const u32 *)(mem + (a & 0x3FF) * 16); }
 static float fc(float x) { u32 b; memcpy(&b, &x, 4); if ((b & 0x7F800000u) == 0x7F800000u) { b = (b & 0x80000000u) | 0x7F7FFFFFu; memcpy(&x, &b, 4); } return x; }
@@ -47,6 +51,7 @@ int native_shrub_run(u8 *mem, u32 pc, u32 top, void (*emit)(const u32 *, u32))
         for (u32 b = 0; b < sh.nad; b++) for (u32 a = 0; a < 4; a++) memcpy(sh.ad[b][a], Q(mem, top + 1 + sh.nstrip + b * 4 + a), 16);
         for (u32 j = 0; j < sh.nvert; j++) { memcpy(sh.pos[j], Q(mem, top + sh.voff + j), 16); memcpy(sh.st[j], Q(mem, top + sh.voff + h[2] + j), 16); }
         sh.top = top; sh.valid = 1;
+        sm_class();
         sh.bufx = 2064 - sh.bufx - sh.bufy;        /* the buffer neither of the last two used */
         u32 bufs[2] = { sh.bufx, sh.bufy };
         for (int k = 0; k < 2; k++) {
@@ -82,6 +87,7 @@ int native_shrub_run(u8 *mem, u32 pc, u32 top, void (*emit)(const u32 *, u32))
             if (fog > sh.clamp[1]) fog = sh.clamp[1];
             s32 fogi = ftoi4(fog);
             u32 alpha = Q(mem, cols)[3];
+            static u8 rgba[256 * 4];
             /* the program's quirk: when the third vertex ends the list early, the fourth vertex's
                color is read with the instance's color base added twice (whatever lies there) */
             int quirk = sh.nvert > 3 && (sh.st[2][3] & 0x8000);
@@ -99,15 +105,173 @@ int native_shrub_run(u8 *mem, u32 pc, u32 top, void (*emit)(const u32 *, u32))
                 if (quirk && j == 3) ci += cols;
                 const u32 *c = Q(mem, ci);
                 o[4] = c[0]; o[5] = c[1]; o[6] = c[2]; o[7] = alpha;
+                rgba[j * 4] = (u8)c[0]; rgba[j * 4 + 1] = (u8)c[1]; rgba[j * 4 + 2] = (u8)c[2]; rgba[j * 4 + 3] = (u8)alpha;
                 o[8] = (u32)ftoi4(fc(v[0] * q)); o[9] = (u32)ftoi4(fc(v[1] * q)); o[10] = (u32)ftoi4(fc(v[2] * q)); o[11] = (u32)fogi;
             }
             if (buf + size > 0x400) size = 0x400 - buf;
             memcpy(pk, bm, size * 16);
             { u32 t = sh.bufx; sh.bufx = sh.bufy; sh.bufy = t; }
-            emit(pk, size);
+            if (!sm_draw((const float (*)[4])R, fogi, rgba)) emit(pk, size);
         }
         return 1;
     }
     }
     return 0;
+}
+
+/* ---- shrubs as native meshes ----
+ * As ties (native_tie.c): a class's vertices, texture coordinates and strips become a mesh the
+ * first time its packet is seen (found again by its contents, the texture registers' values
+ * aside); an instance is that mesh with its transform, colours (its table, its alpha) and fog,
+ * in place of its GS packet. The program's output buffers in VU memory are still written as
+ * the program wrote them. The packet's shape is checked when the mesh is made (items one after
+ * another from qword 0 to the end-of-packet tag, every strip vertex a vertex's place, q 1, the
+ * packet within its buffer); else the class goes as packets. UYA_NSHRUBMESH=0: the packets. */
+#define SM_ID0 20480u
+#define SM_N 4096u
+typedef struct { int kind; u32 blk, first, count; u64 prim; int pre; } SmOp;   /* kind 0: a texture block; 1: strips */
+typedef struct { u32 *key; u32 nkey; int ok; u32 nv; u8 *rgba; SmOp *op; int nop; } ShrubMesh;
+static ShrubMesh *smt; static u32 nsm;
+static int sm_on = -1, sm_cur = -1;
+static unsigned long long sm_n_mesh, sm_n_pk;
+#define SH_H 8192
+static u64 sh_k[SH_H]; static int sh_v[SH_H];
+static u32 skey[8 + 16 * 4 + 4 * 2 + 256 * 8];
+
+static u32 sm_key(void)
+{
+    u32 n = 0;
+    skey[n++] = sh.nad; skey[n++] = sh.nstrip; skey[n++] = sh.nvert;
+    memcpy(skey + n, sh.tag_ad, 16); n += 4;
+    for (u32 t = 0; t < sh.nstrip; t++) { memcpy(skey + n, sh.tags[t], 16); n += 4; }
+    for (u32 b = 0; b < sh.nad; b++) for (u32 a = 0; a < 4; a++) skey[n++] = (sh.ad[b][a][2] & 0xFF) | (a ? 0 : (sh.ad[b][0][3] & 0x3FF) << 8);
+    for (u32 j = 0; j < sh.nvert; j++) { memcpy(skey + n, sh.pos[j], 16); n += 4; memcpy(skey + n, sh.st[j], 16); n += 4; }
+    return n;
+}
+static void sm_drop(void)
+{
+    for (u32 i = 0; i < nsm; i++) { if (smt[i].ok) native_mesh_free(SM_ID0 + i); free(smt[i].key); free(smt[i].rgba); free(smt[i].op); }
+    nsm = 0; memset(sh_k, 0, sizeof sh_k);
+}
+static int sm_fail(int line) { static int n; if (n++ < 8) uya_log("native shrub meshes: a class goes as packets (native_shrub.c:%d)", line); return 0; }
+static int sm_build(ShrubMesh *m, u32 id)
+{
+    u64 ta = ((u64)sh.tag_ad[1] << 32) | sh.tag_ad[0];
+    int ad1 = (ta & 0x7FFF) == 4 && ((ta >> 60) & 15) == 1 && (sh.tag_ad[2] & 15) == 0xE, ad4 = (ta & 0x7FFF) == 1 && ((ta >> 60) & 15) == 4 && (sh.tag_ad[2] & 0xFFFF) == 0xEEEE;   /* (four A+D qwords, either way) */
+    if (!(ad1 || ad4) || ((ta >> 58) & 3) || (ta & 0x8000)) { static int t; if (!t++) uya_log("native shrub meshes: A+D tag %08X %08X %08X %08X", sh.tag_ad[0], sh.tag_ad[1], sh.tag_ad[2], sh.tag_ad[3]); return sm_fail(__LINE__); }
+    static s8 item[0x400]; static s16 itemk[0x400], start[0x400], vtx[0x400];
+    memset(item, 0, sizeof item); memset(start, 0xFF, sizeof start); memset(vtx, 0xFF, sizeof vtx);
+    const u32 lim = 1024 - 856;                    /* (the last buffer's room: a packet within it is within every buffer) */
+    for (u32 b = 0; b < sh.nad; b++) {
+        u32 d = sh.ad[b][0][3] & 0x3FF;
+        if (d + 5 > lim) return sm_fail(__LINE__);
+        for (u32 q = d; q < d + 5; q++) if (item[q]) return sm_fail(__LINE__);
+        item[d] = 1; itemk[d] = (s16)b; for (u32 q = d + 1; q < d + 5; q++) item[q] = 3;
+    }
+    for (u32 t = 0; t < sh.nstrip; t++) {
+        u64 ts = ((u64)sh.tags[t][1] << 32) | sh.tags[t][0];
+        if (((ts >> 58) & 3) || ((ts >> 60) & 15) != 3 || (sh.tags[t][2] & 0xFFF) != 0x412) return sm_fail(__LINE__);
+        u32 d = sh.tags[t][3] & 0x3FF;
+        if (d + 1 + 3 * (sh.tags[t][0] & 0x7FFF) > lim || item[d]) return sm_fail(__LINE__);
+        item[d] = 2; itemk[d] = (s16)t;
+    }
+    for (u32 j = 0; j < sh.nvert; j++) {
+        if (sh.st[j][2] != 4096) return sm_fail(__LINE__);
+        u32 sl = (u32)sh.pos[j][3] & 0x7FFF;
+        if (sl + 3 > lim) return sm_fail(__LINE__);
+        for (u32 q = sl; q < sl + 3; q++) {
+            if (item[q]) return sm_fail(__LINE__);
+            if (start[q] >= 0 && (u32)start[q] != sl) return sm_fail(__LINE__);
+            start[q] = (s16)sl;
+        }
+        vtx[sl] = (s16)j;
+    }
+    static float v6[256 * 6]; static u32 idx[0x400 * 3]; static SmOp op[64];
+    u32 ni = 0; int nop = 0, eop = 0, blk = 0;
+    for (u32 q = 0; q < lim && !eop;) {
+        if (item[q] == 1) {
+            if (nop == 64) return sm_fail(__LINE__);
+            op[nop].kind = 0; op[nop].blk = (u32)itemk[q]; nop++; blk = 1;
+            q += 5;
+        } else if (item[q] == 2) {
+            const u32 *tg = sh.tags[itemk[q]];
+            u64 ts = ((u64)tg[1] << 32) | tg[0];
+            u32 n = tg[0] & 0x7FFF; int pre = (int)((ts >> 46) & 1); u64 prim = (ts >> 47) & 0x7FF;
+            if (!blk) return sm_fail(__LINE__);
+            if (!(nop && op[nop - 1].kind == 1 && op[nop - 1].pre == pre && op[nop - 1].prim == prim)) {
+                if (nop == 64) return sm_fail(__LINE__);
+                op[nop].kind = 1; op[nop].first = ni; op[nop].count = 0; op[nop].pre = pre; op[nop].prim = prim; nop++;
+            }
+            u32 w[3] = { 0, 0, 0 };
+            for (u32 k = 0; k < n; k++) {
+                u32 sl = q + 1 + 3 * k;
+                if (vtx[sl] < 0) return sm_fail(__LINE__);
+                w[0] = w[1]; w[1] = w[2]; w[2] = (u32)vtx[sl];
+                if (k >= 2) { idx[ni++] = w[0]; idx[ni++] = w[1]; idx[ni++] = w[2]; op[nop - 1].count += 3; }
+            }
+            if (tg[0] & 0x8000) eop = 1;
+            q += 1 + 3 * n;
+        } else return sm_fail(__LINE__);
+    }
+    if (!eop || !ni) return sm_fail(__LINE__);
+    for (u32 j = 0; j < sh.nvert; j++) {
+        float *o = v6 + j * 6;
+        o[0] = (float)sh.pos[j][0]; o[1] = (float)sh.pos[j][1]; o[2] = (float)sh.pos[j][2]; o[3] = 1.0f;
+        o[4] = itof12(sh.st[j][0]); o[5] = itof12(sh.st[j][1]);
+    }
+    m->nv = sh.nvert; m->rgba = calloc(sh.nvert, 4);
+    m->op = malloc(nop * sizeof *op); memcpy(m->op, op, nop * sizeof *op); m->nop = nop;
+    native_mesh_create(SM_ID0 + id, v6, m->rgba, m->nv, idx, ni);
+    return 1;
+}
+static void sm_class(void)
+{
+    sm_cur = -1;
+    if (sm_on < 0) { const char *e = getenv("UYA_NSHRUBMESH"), *n = getenv("UYA_NATIVE"); sm_on = !(e && !atoi(e)) && !(n && !atoi(n)); }
+    if (!sm_on) return;
+    u32 nk = sm_key();
+    u64 h = 1469598103934665603ull;
+    for (u32 i = 0; i < nk; i++) h = (h ^ skey[i]) * 1099511628211ull;
+    if (!h) h = 1;
+    u32 s = (u32)(h >> 51) & (SH_H - 1);
+    while (sh_k[s]) {
+        if (sh_k[s] == h) { ShrubMesh *m = &smt[sh_v[s]]; if (m->nkey == nk && !memcmp(m->key, skey, nk * 4)) { sm_cur = sh_v[s]; return; } }
+        s = (s + 1) & (SH_H - 1);
+    }
+    if (!smt) smt = calloc(SM_N, sizeof *smt);
+    if (nsm == SM_N) { sm_drop(); sm_class(); return; }
+    ShrubMesh *m = &smt[nsm];
+    memset(m, 0, sizeof *m);
+    m->key = malloc(nk * 4); memcpy(m->key, skey, nk * 4); m->nkey = nk;
+    m->ok = sm_build(m, nsm);
+    sh_k[s] = h; sh_v[s] = (int)nsm;
+    sm_cur = (int)nsm++;
+}
+static int sm_draw(const float R[4][4], s32 fogi, const u8 *rgba)
+{
+    if (sm_cur < 0 || !smt[sm_cur].ok || (fogi & 0x8000)) { if (++sm_n_pk % 100000 == 1) uya_log("native shrub meshes: %llu instances as packets (class %d, fog %08X)", sm_n_pk, sm_cur, (u32)fogi); return 0; }
+    ShrubMesh *m = &smt[sm_cur];
+    u32 id = SM_ID0 + (u32)sm_cur;
+    if (memcmp(rgba, m->rgba, m->nv * 4)) { memcpy(m->rgba, rgba, m->nv * 4); native_mesh_colors(id, m->rgba, m->nv); }
+    float xf[32];
+    for (int r = 0; r < 4; r++) for (int k = 0; k < 4; k++) xf[r * 4 + k] = R[r][k];
+    float F = (float)((fogi >> 4) & 0xFF);
+    xf[16] = 1.0f; xf[17] = F; xf[18] = F; xf[19] = 0.0f;
+    xf[20] = xf[21] = xf[22] = 0.0f; xf[23] = -3.4028235e38f;   /* (no near limit: these shrubs are inside the view) */
+    xf[24] = xf[25] = xf[26] = xf[27] = 0.0f;
+    xf[28] = 0.0f; xf[29] = 0.0f; xf[30] = 1e-30f; xf[31] = 1.0f;   /* (the GPU: no near or far cut but w > 0) */
+    extern const char *uya_gs_src; uya_gs_src = "native shrub";
+    for (int k = 0; k < m->nop; k++) {
+        const SmOp *o = &m->op[k];
+        if (o->kind == 0) {
+            u32 a[4]; u64 v[4];
+            for (int j = 0; j < 4; j++) { const u32 *q = sh.ad[o->blk][j]; a[j] = q[2] & 0xFF; v[j] = ((u64)q[1] << 32) | q[0]; }
+            native_regs(a, v, 4);
+        } else {
+            if (o->pre) { u32 a = 0; u64 v = o->prim; native_regs(&a, &v, 1); }
+            native_mesh_draw(id, o->first, o->count, xf);
+        }
+    }
+    if (++sm_n_mesh % 100000 == 0) { u32 bad = 0; for (u32 i = 0; i < nsm; i++) bad += !smt[i].ok; uya_log("native shrub meshes: %u classes (%u as packets), instances %llu as meshes, %llu as packets", nsm, bad, sm_n_mesh, sm_n_pk); }
+    return 1;
 }

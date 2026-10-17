@@ -93,6 +93,8 @@ typedef uint64_t GLuint64;
 #define GL_TEXTURE0 0x84C0
 #define GL_ARRAY_BUFFER 0x8892
 #define GL_STREAM_DRAW 0x88E0
+#define GL_STATIC_DRAW 0x88E4
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
 #define GL_DYNAMIC_DRAW 0x88E8
 #define GL_FRAGMENT_SHADER 0x8B30
 #define GL_VERTEX_SHADER 0x8B31
@@ -140,6 +142,8 @@ typedef uint64_t GLuint64;
     X(glTexSubImage2D, void, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
     X(glTexParameteri, void, (GLenum, GLenum, GLint)) \
     X(glDrawArrays, void, (GLenum, GLint, GLsizei)) \
+    X(glDrawElements, void, (GLenum, GLsizei, GLenum, const void *)) \
+    X(glUniform4fv, void, (GLint, GLsizei, const GLfloat *)) \
     X(glFlush, void, (void)) \
     X(glFinish, void, (void)) \
     X(glGenBuffers, void, (GLsizei, GLuint *)) \

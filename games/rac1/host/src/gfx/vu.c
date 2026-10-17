@@ -166,12 +166,16 @@ static void seq_end(const RcVu0 *v)
 #include "../native/native_shrub.h"
 #include "../native/native_tfrag.h"
 #include "../native/native_moby.h"
+#include "../native/native_dlist.h"
+#include "../native/native_tfragclip.h"
+#include "../native/native_shrubclip.h"
+#include "../native/native_tieclip.h"
 void uya_gif_packet(const u32 *data, u32 qwc);
 static const char *native_src = "PATH1 native";
 static void native_emit(const u32 *pk, u32 qwc)
 {
     extern const char *uya_gs_src; uya_gs_src = native_src;
-    uya_gif_packet(pk, qwc);
+    native_kick(pk, qwc);
 }
 static int native_vu1(const char *img, u32 pc)
 {
@@ -194,7 +198,63 @@ static int native_vu1(const char *img, u32 pc)
             return 0;
         }
         extern const char *uya_gs_src;
-        for (u32 i = 0; i < k.npk; i++) { uya_gs_src = "PATH1 native moby"; uya_gif_packet(k.d + k.off[i] * 4, k.len[i]); }
+        for (u32 i = 0; i < k.npk; i++) { uya_gs_src = "PATH1 native moby"; native_kick(k.d + k.off[i] * 4, k.len[i]); }
+        return 1;
+    }
+    if (img[0] == '2' && !strcmp(img, "224979")) {          /* ties crossing the view frustum (tie clip) */
+        static u32 out[0x4000 * 4];
+        static NativeTieclipPacket pk[1024];
+        /* the registers it carries from run to run are the VU1's (other programs share them) */
+        NativeTieclipRegs r;
+        for (int k = 0; k < 16; k++) r.vi[k] = (u16)rc_vu1.vi[k];
+        memcpy(r.vf21, rc_vu1.vf[21], 16); memcpy(r.vf22, rc_vu1.vf[22], 16); memcpy(r.vf23, rc_vu1.vf[23], 16);
+        memcpy(r.vf29, rc_vu1.vf[29], 16); memcpy(r.vf30, rc_vu1.vf[30], 16); memcpy(r.vf31, rc_vu1.vf[31], 16);
+        memcpy(&r.vf1w, &rc_vu1.vf[1][3], 4); memcpy(&r.vf25w, &rc_vu1.vf[25][3], 4); memcpy(&r.vf26w, &rc_vu1.vf[26][3], 4);
+        native_tieclip_seed(&r);
+        int n = native_tieclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x4000, pk, 1024);
+        if (n < 0) {
+            static int told; if (!told++) uya_log("native tie clip: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        native_tieclip_state(&r);
+        for (int k = 1; k < 16; k++) if (k != 9 && k != 10 && k != 11 && k != 13) rc_vu1.vi[k] = r.vi[k];   /* (9, 10, 11, 13: dead between runs) */
+        memcpy(rc_vu1.vf[21], r.vf21, 16); memcpy(rc_vu1.vf[22], r.vf22, 16); memcpy(rc_vu1.vf[23], r.vf23, 16);
+        memcpy(rc_vu1.vf[29], r.vf29, 16); memcpy(rc_vu1.vf[30], r.vf30, 16); memcpy(rc_vu1.vf[31], r.vf31, 16);
+        memcpy(&rc_vu1.vf[1][3], &r.vf1w, 4); memcpy(&rc_vu1.vf[25][3], &r.vf25w, 4);
+        extern const char *uya_gs_src;
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tie clip"; native_kick(out + pk[i].off * 4, pk[i].n); }
+        return 1;
+    }
+    if (img[0] == '9' && !strcmp(img, "912339")) {          /* shrubs crossing the view frustum (shrub clip) */
+        /* the registers it carries from run to run are the VU1's (other programs share them) */
+        native_shrubclip_seed((const u32 (*)[4])rc_vu1.vf, rc_vu1.vi);
+        native_src = "PATH1 native shrub clip";
+        if (native_shrubclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), native_emit) < 0) {
+            static int told; if (!told++) uya_log("native shrub clip: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        native_shrubclip_state((u32 (*)[4])rc_vu1.vf, rc_vu1.vi);
+        return 1;
+    }
+    if (img[0] == '9' && !strcmp(img, "903379")) {          /* terrain crossing the view frustum (tfrag clip) */
+        static u32 out[0x4000 * 4];
+        static NativeTfragclipPacket pk[512];
+        /* the registers it carries from run to run are the VU1's (other programs change them) */
+        NativeTfragclipRegs r;
+        memcpy(r.vf3, rc_vu1.vf[3], 16);
+        r.clip = rc_vu1.clip & 0xFFFFFF; r.vi15 = rc_vu1.vi[15] & 0xFFFF;
+        memcpy(&r.vf26w, &rc_vu1.vf[26][3], 4); memcpy(&r.vf27w, &rc_vu1.vf[27][3], 4);
+        native_tfragclip_seed(&r);
+        int n = native_tfragclip_run(pc, (u8 *)(uintptr_t)0x1100C000u, vu_vif_top(1), out, 0x4000, pk, 512);
+        if (n < 0) {
+            static int told; if (!told++) uya_log("native tfrag clip: no native code for the program's start 0x%04X (the program runs)", pc);
+            return 0;
+        }
+        native_tfragclip_state(&r);
+        memcpy(rc_vu1.vf[3], r.vf3, 16);
+        rc_vu1.clip = rc_vu1.cl_int = r.clip; rc_vu1.vi[15] = r.vi15;
+        extern const char *uya_gs_src;
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tfrag clip"; native_kick(out + pk[i].off * 4, pk[i].n); }
         return 1;
     }
     if (img[0] == '5' && !strcmp(img, "55907")) {           /* terrain (tfrag) */
@@ -208,7 +268,7 @@ static int native_vu1(const char *img, u32 pc)
             return 0;
         }
         extern const char *uya_gs_src;
-        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tfrag"; uya_gif_packet(out + pk[i].off * 4, pk[i].n); }
+        for (int i = 0; i < n; i++) { uya_gs_src = "PATH1 native tfrag"; native_kick(out + pk[i].off * 4, pk[i].n); }
         return 1;
     }
     if (img[0] == '1' && !strcmp(img, "13507")) {           /* ties */
@@ -221,11 +281,12 @@ static int native_vu1(const char *img, u32 pc)
             if (!sz) return 0;
             extern const char *uya_gs_src;
             u32 top = vu_vif_top(1), ns = native_tie_state((u8 *)(uintptr_t)0x1100C000u, top, buf);
-            if (ns) { uya_gs_src = "PATH1 native tie"; uya_gif_packet(buf, ns); }
+            if (ns) { uya_gs_src = "PATH1 native tie"; native_kick(buf, ns); }
+            if (native_tie_mesh(mem, top)) return 1;
             memset(buf, 0, sz * 16);
             u32 n = native_tie_draw(mem, top, buf);
             uya_gs_src = "PATH1 native tie";
-            if (n) uya_gif_packet(buf, n);
+            if (n) native_kick(buf, n);
             return 1;
         }
         }

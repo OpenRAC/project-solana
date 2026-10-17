@@ -20,6 +20,18 @@ int  gsgl_init(u32 *vram);                /* with a current GL 3.3 context: 1 if
 void gsgl_prim(const pcmd_t *st, u32 st_index, const pprim_t *pr);
 void gsgl_flush(void);                    /* draw the batched primitives */
 
+/* native meshes (host/src/native): geometry on the GPU, transformed by a vertex shader as the
+ * PS2's vector units would, drawn into the same targets through the same pixel stage.
+ * v6: x y z w s t per vertex (floats; w: the weight of the matrix's row 3, 1 for a point), rgba
+ * per vertex, triangle indices. -1: not available. */
+int  gsgl_mesh_create(const float *v6, const u8 *rgba, int nv, const u32 *idx, int ni);
+void gsgl_mesh_update(int id, const float *v6, const u8 *rgba);   /* (v6 0: the colours only) */
+void gsgl_mesh_free(int id);
+/* xf: rows 0..3 of the matrix (16 floats); Q numerator, fog min, fog max, fog offset; screen
+ * offset x y z and the near limit; XYOFFSET x y in pixels, texture width and height; the
+ * frustum's clip scale (near and far: |z c.z| <= |w c.w|; c.z 0: the near limit instead) */
+void gsgl_mesh_draw(const pcmd_t *st, u32 st_index, int id, int first, int count, const float *xf);
+
 /* textures (cmd_setup): 1 if the texture is read from a GPU target directly
  * (p->rt set); else whether a level's memory is newer on the GPU (it is then
  * decoded only if a batch needs it: gs_tex_late); a decoded level in use */

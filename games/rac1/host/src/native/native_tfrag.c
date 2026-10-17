@@ -297,6 +297,21 @@ static void draw_lod(Run *r, int clipped)
     strips(r, &V);
 }
 
+/* the LOD starts' work before the strips (native_terrain.c draws the strips itself) */
+int native_tfrag_lod_vertices(u32 pc, u8 *mem, u32 top)
+{
+    Run r = { mem, top & 0x3FF, 0, 0, 0, 0, 0, 0 };
+    switch (pc) {
+    case 0x40: transform_array(&r, w16(mem, r.B, 0)); morph(&r, 0, 1); collapse(&r, 0); return 0;
+    case 0x50: transform_array(&r, w16(mem, r.B, 0)); morph(&r, 0, 0); return 0;
+    case 0x70: transform_array(&r, w16(mem, r.B, 0)); morph(&r, 0, 0); morph(&r, 1, 1); collapse(&r, 1); return 0;
+    case 0x80: transform_array(&r, (w16(mem, r.B, 0) + w16(mem, r.B, 2)) & 0xFFFF); morph(&r, 1, 0); return 0;
+    }
+    return -1;
+}
+void native_tfrag_cscale(float c[4]) { memcpy(c, st.cscale, 16); }
+void native_tfrag_set_cscale(const float c[4]) { memcpy(st.cscale, c, 16); }
+
 int native_tfrag_run(u32 pc, u8 *mem, u32 top, u32 *out, u32 out_cap, NativeTfragPacket *pk, int maxpk)
 {
     Run r = { mem, top & 0x3FF, out, out_cap, 0, pk, 0, maxpk };

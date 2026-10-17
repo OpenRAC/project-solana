@@ -338,7 +338,8 @@ static u32 lru_clock;
 static struct { unsigned long long flushes, draws, prims, dl_pages, dl_reads, ul_pages, tex_ul, copies, late, atlas_resets; } st, st0;
 
 /* GL objects */
-static GLuint prog, vao, vbo, prog_p, vao_p;
+static GLuint prog, vao, vbo, prog_p, vao_p, prog_n;
+static GLint un_i, un_apass, un_vp, un_m, un_k, un_o, un_x, un_c;   /* the native mesh program's uniforms */
 static GLint u_i, u_apass, u_vp, up_src, up_lim, up_tsz, up_mode, up_ps;
 static GLuint dummy_ui, dummy_f;
 static GLuint rd_fbo, rd_fbo_z, tmp_tex[2], tmp_fbo[2], cap_tex, cap_fbo;
@@ -1129,23 +1130,15 @@ static void copy_rect(GLuint src_tex, int which, int x0, int y0, int x1, int y1)
     st.copies++;
 }
 
-void gsgl_flush(void)
+/* the GL state for drawing with state p (the batch's bs, or a native draw's): the targets made
+ * current over the box (x0, y0)-(x1, y1) (the batch's bounding box: bx0..by1), the texture
+ * records, blending, depth, the uniforms and the alpha-test passes; 0 if nothing can be drawn */
+typedef struct { int apass, cm, zw; } fpass_t;
+typedef struct { tgt_t *ct, *zt; int x0, y0, x1, y1, np; fpass_t ps[2]; GLint U[40]; } flush_t;
+static int flush_setup(pcmd_t *p, flush_t *fx)
 {
-    if (!b_on) return;
-    if (getenv("UYA_GLBRK")) {   /* testing: who ends batches */
-        static void *ra[64]; static unsigned long long rn[64], tot; void *r = __builtin_return_address(0); int i;
-        for (i = 0; i < 64 && ra[i] && ra[i] != r; i++) ;
-        if (i < 64) { ra[i] = r; rn[i]++; }
-        if (++tot % 40000 == 0) for (i = 0; i < 64 && ra[i]; i++) uya_log("flush from %p: %llu", ra[i], rn[i]);
-    }
-    b_on = 0;
-    if (!nv || in_flush) { nv = 0; return; }
-    in_flush = 1;
-    st.flushes++;
-    if (strict < 0) { const char *e = getenv("UYA_GL_STRICT"); strict = e && atoi(e); }
-    pcmd_t *p = &bs;
     int fc = cls_of(p->fpsm);
-    if (fc < 0 || CLS_Z(fc)) { logonce(&lg_fmt, "a frame buffer format it cannot draw"); goto done; }
+    if (fc < 0 || CLS_Z(fc)) { logonce(&lg_fmt, "a frame buffer format it cannot draw"); return 0; }
     tgt_t *ct = tgt_get(p->fbp, p->fbw, fc, 0, 0);
     int x0 = (int)floorf(bx0) - 1, y0 = (int)floorf(by0) - 1, x1 = (int)ceilf(bx1) + 1, y1 = (int)ceilf(by1) + 1;
     if (x0 < p->sx0) x0 = p->sx0;
@@ -1156,7 +1149,7 @@ void gsgl_flush(void)
     if (y0 < 0) y0 = 0;
     if (x1 > ct->w - 1) x1 = ct->w - 1;
     if (y1 > ct->rows * ct->ph - 1) y1 = ct->rows * ct->ph - 1;
-    if (x0 > x1 || y0 > y1) goto done;
+    if (x0 > x1 || y0 > y1) return 0;
     tgt_t *zt = 0;
     int zwrite = p->zte && !p->zmsk;
     if (p->zte && (p->ztst != 1 || zwrite)) {
@@ -1350,7 +1343,7 @@ void gsgl_flush(void)
     }
     int zw = zt && zwrite;
     /* passes: the alpha test's failing pixels get the AFAIL writes */
-    struct { int apass, cm, zw; } ps[2]; int np = 0;
+    fpass_t *ps = fx->ps; int np = 0;
     if (!p->ate || p->atst == 1) { ps[0].apass = 0; ps[0].cm = cm; ps[0].zw = zw; np = 1; }
     else {
         int fcm = cm, fzw = 0;
@@ -1363,7 +1356,7 @@ void gsgl_flush(void)
         else if (p->atst == 0) { ps[0].apass = 0; ps[0].cm = fcm; ps[0].zw = fzw; np = 1; }
         else { ps[0].apass = 1; ps[0].cm = cm; ps[0].zw = zw; ps[1].apass = 2; ps[1].cm = fcm; ps[1].zw = fzw; np = 2; }
     }
-    GLint U[4 * 10];
+    GLint *U = fx->U;
     {
         int lin_mxl = p->mxl;
         int zfmt = p->zpsm == 0x30 ? 1 : ((p->zpsm == 0x32 || p->zpsm == 0x3A) ? 2 : 0);
@@ -1381,6 +1374,30 @@ void gsgl_flush(void)
         memcpy(U, u, sizeof u);
     }
 
+    fx->ct = ct; fx->zt = zt; fx->x0 = x0; fx->y0 = y0; fx->x1 = x1; fx->y1 = y1; fx->np = np;
+    return 1;
+}
+
+void gsgl_flush(void)
+{
+    if (!b_on) return;
+    if (getenv("UYA_GLBRK")) {   /* testing: who ends batches */
+        static void *ra[64]; static unsigned long long rn[64], tot; void *r = __builtin_return_address(0); int i;
+        for (i = 0; i < 64 && ra[i] && ra[i] != r; i++) ;
+        if (i < 64) { ra[i] = r; rn[i]++; }
+        if (++tot % 40000 == 0) for (i = 0; i < 64 && ra[i]; i++) uya_log("flush from %p: %llu", ra[i], rn[i]);
+    }
+    b_on = 0;
+    if (!nv || in_flush) { nv = 0; return; }
+    in_flush = 1;
+    st.flushes++;
+    if (strict < 0) { const char *e = getenv("UYA_GL_STRICT"); strict = e && atoi(e); }
+    pcmd_t *p = &bs;
+    flush_t fx_;
+    if (!flush_setup(p, &fx_)) goto done;
+    tgt_t *ct = fx_.ct, *zt = fx_.zt; int x0 = fx_.x0, y0 = fx_.y0, x1 = fx_.x1, y1 = fx_.y1, np = fx_.np;
+    GLint *U = fx_.U;
+#define ps fx_.ps
     p_glUniform4f(u_vp, 2.0f / (float)ct->w, 2.0f / (float)TGH, 0.5f - 1.0f / 128.0f, (float)sc);   /* (w: the point size) */
     int first;
     {   /* the vertices into a ring buffer: written ahead of what the GPU reads, orphaned when it wraps */
@@ -1448,6 +1465,7 @@ void gsgl_flush(void)
                         R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7], R[8], R[9], R[12], R[13], R[16], R[17], R[18], R[19], R[20], R[21], q->defer); }
         }
     }
+#undef ps
 done:
     {   /* UYA_GLDEBUG: GL errors after batches */
         static int dbg = -1, left = 20;
@@ -1458,6 +1476,92 @@ done:
     in_flush = 0;
     gsgl_batch_id++;                                    /* the batch's texture slots are free to go */
     if (glt_q) { glt_wr = glt_pend; glt_publish(); }   /* the batch to the GL thread now */
+}
+
+/* ---- native meshes ----
+ * Geometry the native renderers (host/src/native) keep on the GPU: positions and texture
+ * coordinates once (a level's), colours updatable (the game relights them), triangle
+ * indices; drawn with nvs_src's transform into the same targets as everything else, through
+ * the same pixel stage, with the state of a pcmd_t (the game's material as GS state). */
+#define NMESH 32768
+static struct { GLuint vao, vb, cb, ib; int nv, ni, used; } nmesh[NMESH];
+static int nmesh_free = -1;
+int gsgl_mesh_create(const float *v6, const u8 *rgba, int nv, const u32 *idx, int ni)
+{
+    if (!prog_n || nv <= 0 || ni <= 0) return -1;
+    int id = -1;
+    if (nmesh_free < 0) nmesh_free = 0;
+    for (int k = 0; k < NMESH; k++) { int i = (nmesh_free + k) % NMESH; if (!nmesh[i].used) { id = i; break; } }
+    if (id < 0) { static int told; if (!told++) uya_log("GL GS: out of native mesh slots"); return -1; }
+    nmesh_free = (id + 1) % NMESH;   /* (the next search starts after it) */
+    gsgl_flush();
+    nmesh[id].used = 1; nmesh[id].nv = nv; nmesh[id].ni = ni;
+    if (!nmesh[id].vao) {
+        p_glGenVertexArrays(1, &nmesh[id].vao);
+        p_glGenBuffers(1, &nmesh[id].vb); p_glGenBuffers(1, &nmesh[id].cb); p_glGenBuffers(1, &nmesh[id].ib);
+    }
+    p_glBindVertexArray(nmesh[id].vao); gc.prog = 0;
+    p_glBindBuffer(GL_ARRAY_BUFFER, nmesh[id].vb);
+    p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * 24, v6, GL_STATIC_DRAW);
+    p_glEnableVertexAttribArray(0); p_glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 24, (void *)0);
+    p_glEnableVertexAttribArray(1); p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 24, (void *)16);
+    p_glBindBuffer(GL_ARRAY_BUFFER, nmesh[id].cb);
+    p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * 4, rgba, GL_DYNAMIC_DRAW);
+    p_glEnableVertexAttribArray(2); p_glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_FALSE, 4, (void *)0);
+    p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, nmesh[id].ib);
+    p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)ni * 4, idx, GL_STATIC_DRAW);
+    p_glBindVertexArray(vao);
+    return id;
+}
+void gsgl_mesh_update(int id, const float *v6, const u8 *rgba)
+{
+    if (id < 0 || id >= NMESH || !nmesh[id].used) return;
+    gsgl_flush();
+    if (v6) { p_glBindBuffer(GL_ARRAY_BUFFER, nmesh[id].vb); p_glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)nmesh[id].nv * 24, v6); }
+    p_glBindBuffer(GL_ARRAY_BUFFER, nmesh[id].cb);
+    p_glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)nmesh[id].nv * 4, rgba);
+}
+void gsgl_mesh_free(int id)
+{
+    if (id < 0 || id >= NMESH) return;
+    nmesh[id].used = 0;   /* (the buffers stay for the next mesh in the slot) */
+}
+/* draw indices first..first+count of mesh id (triangles) with state S (as cmd_setup made it)
+ * and the transform xf: 16 floats (rows 0..3), then k (Q numerator, fog min, fog max, fog
+ * offset), o (screen offset x y z, near limit), x (XYOFFSET x y / 16, texture w h), c (the
+ * frustum's clip scale x y z w: z 0 for none) */
+void gsgl_mesh_draw(const pcmd_t *S, u32 sti, int id, int first, int count, const float *xf)
+{
+    if (!prog_n || id < 0 || id >= NMESH || !nmesh[id].used || count <= 0) return;
+    gsgl_flush();
+    if (S->ztst == 0 || !S->fbw) return;
+    if (S->ate && S->atst == 0 && S->afail == 0) return;
+    /* the batch state flush_setup reads: this draw alone, anywhere in the scissor */
+    bs = *S; b_st = sti; b_mode = GL_TRIANGLES; b_on = 0; nv = 0; nrec = 0; cur_rec = 0; nseg = 1;
+    b_uvall = 1; b_spr = 0; b_nspr = 0; b_clut_saved = 0;
+    bx0 = (float)S->sx0; by0 = (float)S->sy0; bx1 = (float)S->sx1; by1 = (float)S->sy1;
+    bu0 = bv0 = 1e30f; bu1 = bv1 = -1e30f;
+    bqmin = 1e-30f; bqmax = 1e30f;       /* (Q anywhere: every mip level the texture has) */
+    pin_levels(S);
+    if (S->tme && S->defer && !S->rt) { clut_snap(0); b_clut_saved = 1; }
+    flush_t fx;
+    if (!flush_setup(&bs, &fx)) { gsgl_batch_id++; return; }
+    p_glUseProgram(prog_n); p_glBindVertexArray(nmesh[id].vao); gc.prog = prog_n;
+    p_glUniform4f(un_vp, 2.0f / (float)fx.ct->w, 2.0f / (float)TGH, 0.5f - 1.0f / 128.0f, (float)sc);
+    p_glUniform4fv(un_m, 4, xf);
+    p_glUniform4fv(un_k, 1, xf + 16); p_glUniform4fv(un_o, 1, xf + 20); p_glUniform4fv(un_x, 1, xf + 24); p_glUniform4fv(un_c, 1, xf + 28);
+    p_glUniform4iv(un_i, 10, fx.U);
+    for (int k = 0; k < fx.np; k++) {
+        p_glUniform1i(un_apass, fx.ps[k].apass);
+        if (gc.cmask != fx.ps[k].cm) { p_glColorMask(fx.ps[k].cm & 1, (fx.ps[k].cm >> 1) & 1, (fx.ps[k].cm >> 2) & 1, (fx.ps[k].cm >> 3) & 1); gc.cmask = fx.ps[k].cm; }
+        if (gc.dmask != fx.ps[k].zw) { p_glDepthMask((GLboolean)fx.ps[k].zw); gc.dmask = fx.ps[k].zw; }
+        p_glDrawElements(GL_TRIANGLES, count, GL_UNSIGNED_INT, (void *)((uintptr_t)first * 4));
+        st.draws++;
+    }
+    gc_apass = -1;
+    p_glBindVertexArray(vao);
+    gsgl_batch_id++;
+    if (glt_q) { glt_wr = glt_pend; glt_publish(); }
 }
 
 /* ---- shaders ---- */
@@ -1475,14 +1579,47 @@ static const char *vs_src =
     "  gl_PointSize = u_vp.w;\n"
     "  v_col = a_col; v_fcol = a_col; v_tex = a_tex; v_div = a_fd.y; v_z = a_dz; v_zr = a_z; v_f = a_fd.x;\n"
     "}\n";
+/* native meshes (host/src/native, gsgl_mesh_*): geometry kept on the GPU, transformed here as
+ * the PS2's vector units did it on the CPU side (row 3 + row 0 x + row 1 y + row 2 z; Q = k / w;
+ * screen = xyz Q + offset, to the GS's 1/16 pixel), feeding the same fragment stage */
+static const char *nvs_src =
+    "#version 330 core\n"
+    "layout(location=0) in vec4 a_pos; layout(location=1) in vec2 a_st; layout(location=2) in vec4 a_col;\n"
+    "uniform vec4 u_vp; uniform vec4 u_m[4]; uniform vec4 u_k; uniform vec4 u_o; uniform vec4 u_x; uniform vec4 u_c;\n"
+    "flat out vec4 v_fcol; flat out float v_div; flat out uint v_zr; flat out int v_rec;\n"
+    "smooth out vec4 m_col; smooth out vec2 m_zf; smooth out vec2 v_st;\n"
+    "void main() {\n"
+    "  vec4 P = u_m[3] * a_pos.w + u_m[0] * a_pos.x; P = P + u_m[1] * a_pos.y; P = P + u_m[2] * a_pos.z;\n"
+    "  float w = P.w, q = u_k.x / w, W = w / u_k.x;\n"
+    "  vec3 sp = P.xyz * q + u_o.xyz;\n"
+    "  vec2 xy = trunc(sp.xy * 16.0) * (1.0 / 16.0) - u_x.xy;\n"
+    "  vec2 p = xy + vec2(u_vp.z);\n"
+    "  vec2 nd = vec2(p.x * u_vp.x - 1.0, p.y * u_vp.y - 1.0);\n"
+    /* clip w is 1/Q, so what the GS interpolates on the screen (STQ, then S/Q per pixel; colour,
+     * Z, fog) is had with perspective: s t, and colour Z fog times 1/Q (the pixel stage multiplies
+     * by Q again). Cut by the GPU at the screen's edges, and at the near and far planes: those of
+     * the frustum (|z u_c.z| <= |w u_c.w|) when u_c.z is given, else 1/Q < u_o.w is out (the CPU form
+     * drops those triangles). */
+    "  float zc = u_c.z != 0.0 ? P.z * u_c.z / abs(u_k.x * u_c.w) : W - 2.0 * u_o.w;\n"
+    "  gl_Position = vec4(nd * W, zc, W);\n"
+    "  v_rec = 0; v_fcol = a_col; v_div = 1.0; v_zr = 0u;\n"
+    "  m_col = a_col * W;\n"
+    "  v_st = a_st * u_x.zw;\n"
+    "  m_zf = vec2(max(trunc(sp.z), 0.0), trunc(clamp(w + u_k.w, u_k.y, u_k.z))) * W;\n"   /* (Z and F: integers per vertex, as XYZF2 sends them) */
+    "}\n";
 static const char *fs_src =
     "#version 330 core\n"
     "uniform usampler2D u_atlas;\n"
     "uniform isamplerBuffer u_rec;\n"
     "uniform sampler2D u_rt, u_dt;\n"
     "uniform ivec4 u_i[10]; uniform int u_apass; uniform int u_sc;\n"
-    "noperspective in vec4 v_col; flat in vec4 v_fcol; noperspective in vec3 v_tex; flat in float v_div;\n"
-    "noperspective in float v_z; noperspective in float v_f; flat in uint v_zr; flat in int v_rec;\n"
+    "flat in vec4 v_fcol; flat in float v_div; flat in uint v_zr; flat in int v_rec;\n"
+    "#ifdef MESH\n"   /* (a native mesh: the GS's screen-linear values come with perspective, times clip w) */
+    "smooth in vec4 m_col; smooth in vec2 m_zf; smooth in vec2 v_st;\n"
+    "#define v_col (m_col * (gl_FragCoord.w * 1.000004))\n#define v_z (m_zf.x * gl_FragCoord.w)\n#define v_f (m_zf.y * (gl_FragCoord.w * 1.000004))\n"   /* (colour and fog are truncated: a hair over, so a vertex's own value is had) */
+    "#else\n"
+    "noperspective in vec4 v_col; noperspective in vec3 v_tex; noperspective in float v_z; noperspective in float v_f;\n"
+    "#endif\n"
     "ivec4 R0, R1, R2, R3; int RB;\n"
     "layout(location=0, index=0) out vec4 o_c;\n"
     "layout(location=0, index=1) out vec4 o_b;\n"
@@ -1573,7 +1710,12 @@ static const char *fs_src =
     "  RB = v_rec * 18; R0 = texelFetch(u_rec, RB); R1 = texelFetch(u_rec, RB + 1); R2 = texelFetch(u_rec, RB + 2); R3 = texelFetch(u_rec, RB + 3);\n"
     "  ivec4 c = IIP != 0 ? ivec4(v_col - (dFdx(v_col) + dFdy(v_col)) * (float(u_sc) / 128.0)) : ivec4(v_fcol);\n"
     "  if (TME != 0) {\n"
-    "    vec3 tx = v_tex - (dFdx(v_tex) + dFdy(v_tex)) * (float(u_sc) / 128.0);   /* at the GS's sample point (the vertices are 1/128 pixel off) */\n"
+    "#ifdef MESH\n"
+    "    vec3 vt = vec3(v_st * gl_FragCoord.w, gl_FragCoord.w);\n"   /* (a native mesh: STQ from s t with perspective, Q = 1 / clip w) */
+    "#else\n"
+    "    vec3 vt = v_tex;\n"
+    "#endif\n"
+    "    vec3 tx = vt - (dFdx(vt) + dFdy(vt)) * (float(u_sc) / 128.0);   /* at the GS's sample point (the vertices are 1/128 pixel off) */\n"
     "    float u = tx.x, v = tx.y, q = tx.z;\n"
     "    if (v_div != 0.0 && q != 0.0) { float iq = 1.0 / q; u *= iq; v *= iq; }\n"
     "    ivec4 t = ivec4(tsample(u, v, q));\n"
@@ -1669,6 +1811,28 @@ int gsgl_init(u32 *vr)
     prog = link2(compile(GL_VERTEX_SHADER, vs_src), compile(GL_FRAGMENT_SHADER, fs_src), 1);
     prog_p = link2(compile(GL_VERTEX_SHADER, pvs_src), compile(GL_FRAGMENT_SHADER, pfs_src), 0);
     if (!prog || !prog_p) return 0;
+    {   /* the native meshes' pixel stage: fs_src with MESH defined */
+        const char *nl = strchr(fs_src, '\n');
+        size_t n = strlen(fs_src);
+        char *fsm = malloc(n + 32);
+        if (nl && fsm) {
+            size_t h = (size_t)(nl - fs_src) + 1;
+            memcpy(fsm, fs_src, h); strcpy(fsm + h, "#define MESH 1\n"); strcat(fsm + h, fs_src + h);
+            prog_n = link2(compile(GL_VERTEX_SHADER, nvs_src), compile(GL_FRAGMENT_SHADER, fsm), 1);
+        }
+        free(fsm);
+    }
+    if (prog_n) {
+        p_glUseProgram(prog_n);
+        p_glUniform1i(p_glGetUniformLocation(prog_n, "u_atlas"), 0);
+        p_glUniform1i(p_glGetUniformLocation(prog_n, "u_rt"), 7);
+        p_glUniform1i(p_glGetUniformLocation(prog_n, "u_dt"), 8);
+        p_glUniform1i(p_glGetUniformLocation(prog_n, "u_rec"), 9);
+        p_glUniform1i(p_glGetUniformLocation(prog_n, "u_sc"), sc);
+        un_i = p_glGetUniformLocation(prog_n, "u_i"); un_vp = p_glGetUniformLocation(prog_n, "u_vp"); un_apass = p_glGetUniformLocation(prog_n, "u_apass");
+        un_m = p_glGetUniformLocation(prog_n, "u_m"); un_k = p_glGetUniformLocation(prog_n, "u_k");
+        un_o = p_glGetUniformLocation(prog_n, "u_o"); un_x = p_glGetUniformLocation(prog_n, "u_x"); un_c = p_glGetUniformLocation(prog_n, "u_c");
+    } else uya_log("GL GS: native mesh shader did not build (native meshes are not drawn)");
     p_glUseProgram(prog);
     {
         p_glUniform1i(p_glGetUniformLocation(prog, "u_atlas"), 0);

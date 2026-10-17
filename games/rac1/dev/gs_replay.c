@@ -114,6 +114,9 @@ int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: gs_replay rec.bin [frames_dir]\n"); return 1; }
     if (!getenv("UYA_GS_THREADS")) setenv("UYA_GS_THREADS", "0", 1);
+    /* the game's rounding (toward zero, host/src/rac1/boot.c), for the CPU's work on native
+     * meshes (REPLAY_SOFT): REPLAY_RN=1 leaves the C default */
+    if (!getenv("REPLAY_RN")) __builtin_ia32_ldmxcsr(__builtin_ia32_stmxcsr() | 0x6000u);
     if (getenv("REPLAY_PROF")) {
         struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_flags = SA_SIGINFO | SA_RESTART; sa.sa_sigaction = on_prof; sigaction(SIGPROF, &sa, 0);
         struct itimerval it = { { 0, 1000 }, { 0, 1000 } }; setitimer(ITIMER_PROF, &it, 0); atexit(prof_dump);
@@ -144,8 +147,8 @@ int main(int argc, char **argv)
             if (h[1] > 0x10000) { if (bign < h[1] * 16) { free(big); big = malloc(h[1] * 16); bign = h[1] * 16; } d = big; }
             rd(f, d, h[1] * 16);
             double a = now_s(), ac = cpu_s();
-            uya_gs_src = path_name[h[0] < 3 ? h[0] : 2];
-            uya_gs_gif(d, h[1]);
+            if (h[0] == 3) { uya_gs_src = "native"; uya_gs_dlist(d, h[1]); }   /* a native draw list */
+            else { uya_gs_src = path_name[h[0] < 3 ? h[0] : 2]; uya_gs_gif(d, h[1]); }
             t += now_s() - a; c += cpu_s() - ac;
         } else if (k == 2) {
             u64 r[6]; rd(f, r, 48);

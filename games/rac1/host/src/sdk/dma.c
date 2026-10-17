@@ -83,6 +83,16 @@ static void uya_dma_sink(s32 ch, const void *data, u32 qwc)
     if (ch == 2) { extern const char *uya_gs_src; uya_gs_src = "PATH3 (DMA ch2)"; uya_gs_gif(data, qwc); }   /* GIF channel: PATH3 */
 }
 
+/* a VIF1 chain tag the terrain hook kept, sent on as the walker would have */
+#include "../native/native_terrain.h"
+void uya_dma_vif1_replay(const u32 *q, int tte)
+{
+    u32 qwc = q[0] & 0xFFFF, id = (q[0] >> 28) & 7, addr = q[1] & 0x7FFFFFFF;
+    if (tte) uya_vif1_words(q + 2, 2);
+    if (id == 3 || id == 4) uya_dma_sink(1, phys(addr), qwc);
+    else uya_dma_sink(1, q + 4, qwc);
+}
+
 static s32 chan_index(void *chan)
 {
     for (s32 i = 0; i < 10; i++) if ((u32)(uintptr_t)chan == chan_base[i]) return i;
@@ -99,6 +109,7 @@ s32 uyafn_12D938(void *chan, void *tag)
     nsends++;
     if (nsends <= 4 || (nsends & (nsends - 1)) == 0)
         uya_log("DMA send #%llu on channel %d, chain at 0x%08X (%llu qwords so far)", nsends, ch, t, nqw);
+    if (ch == 1) native_terrain_chain();
     for (int guard = 0; guard < 1000000; guard++) {
         u32 *q = phys(t);
         u32 lo = q[0], hi = q[1];
@@ -111,6 +122,12 @@ s32 uyafn_12D938(void *chan, void *tag)
             extern int uya_vif_log;
             uya_vif_log = (long long)nsends == dlog;
             if (uya_vif_log) uya_log("  DMA tag at 0x%08X: id %u qwc %u addr 0x%08X upper %08X %08X", t, id, qwc, addr, q[2], q[3]);
+        }
+        /* terrain draws in the chain become native mesh draws (host/src/native/native_terrain.c) */
+        if (ch == 1) {
+            if (!irq && (id == 1 || id == 3)) {
+                if (native_terrain_tag(q, tte != 0)) { t = id == 3 ? t + 16 : t + 16 + qwc * 16; continue; }
+            } else native_terrain_flush();
         }
         /* Tag transfer (CHCR TTE): the tag's upper 64 bits go to the VIF first
          * (two VIF codes). The menu's VIF1 chains always carry VIF codes there
@@ -151,6 +168,7 @@ s32 uyafn_12D938(void *chan, void *tag)
         if (end) break;
         t = next;
     }
+    if (ch == 1) native_terrain_flush();
     if (ch == 1) {
         void uya_gfx_frame_stats(void); void uya_gif_stats(void);
         static long long stop_after = -2;

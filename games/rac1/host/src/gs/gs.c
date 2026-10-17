@@ -152,6 +152,7 @@ void gs_clut_swap(u32 *pal, u32 *hash)
     u32 t[256]; memcpy(t, clut, sizeof t); memcpy(clut, pal, sizeof t); memcpy(pal, t, sizeof t);
     u32 h = clut_hash; clut_hash = *hash; *hash = h;
 }
+static int sv_on; static void survey_clut(u64 t0);   /* (UYA_MEMSURVEY, below) */
 static u64 clut_pend; static int clut_pending;   /* GL: a load not done yet */
 static void clut_flush(void)
 {
@@ -174,6 +175,7 @@ static void clut_load(u64 t0)
     }
     if (trxlog_on()) uya_log("TEX0 %016llX: CLD %u CBP %04X CSA %u PSM %X CPSM %X -> %s", (unsigned long long)t0, cld, cbp, csa, psm, cpsm, load ? "load" : "keep");
     if (!load) return;
+    if (__builtin_expect(sv_on > 0, 0)) survey_clut(t0);
     if (gsgl_on) {
         int pal = psm == 0x13 || psm == 0x1B || psm == 0x14 || psm == 0x24 || psm == 0x2C;
         gsgl_clut_changed();                 /* (a batch decoding later uses the old palette) */
@@ -305,6 +307,128 @@ static void mark_blocks(u32 bp, u32 nblocks)
     for (u32 p = p0; p <= p1 && p < 512; p++) page_gen[p]++;
     dirty_epoch++;
 }
+/* ---- the game's texture uploads, kept as they came (the native texture path) ----
+ * The game streams its textures to the GS several times a frame: 8-bit
+ * textures (PSMT8) and their palettes go up, are drawn with, and the next set
+ * goes over the same memory (Kerwan: blocks 0x3717 to 0x3AFF). Each PSMT8
+ * upload is kept here as the game sent it (the texture's pixels in order), and
+ * a texture that is exactly a kept upload is decoded from it (tc_get) instead
+ * of being read back out of GS memory. An upload stays usable while nothing
+ * wrote over its blocks since: other uploads and local copies (blk_gen, by
+ * 256-byte block), draws (pg_draw_gen, by page, counted only for draws whose
+ * frame or Z buffer reaches the memory uploads use) and, with GL, GPU targets.
+ * UYA_NTEX=0 decodes everything from GS memory (to compare); UYA_NTEXCHECK=1
+ * decodes both ways and logs any difference. */
+static u32 blk_gen[0x4000];
+static u32 pg_draw_gen[512];
+static u32 up_lo = 0x4000, up_hi;     /* the blocks uploads were kept for (drawing there invalidates them) */
+static u32 up_win_ver;                /* changes when that range grows */
+static int ntex_on = -1, ntex_check = -1;
+/* the blocks a rectangle of a buffer covers (callback per block) */
+static void rect_blocks(u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32 w, u32 h, void (*fn)(u32 blk, void *), void *arg)
+{
+    u32 bwd, bht;
+    switch (psm) {
+    case 0x00: case 0x01: case 0x1B: case 0x24: case 0x2C: bwd = 8; bht = 8; break;
+    case 0x02: case 0x0A: bwd = 16; bht = 8; break;
+    case 0x13: bwd = 16; bht = 16; break;
+    case 0x14: bwd = 32; bht = 16; break;
+    default: {   /* (other formats: every block of the area) */
+        u32 n = (((bw ? bw : 1) * 64 * (y + h) * 32 / 8 + 255) / 256) + 64;
+        for (u32 i = 0; i < n && bp + i < 0x4000; i++) fn(bp + i, arg);
+        return;
+    }
+    }
+    if (!w || !h) return;
+    for (u32 ty = y & ~(bht - 1); ty < y + h; ty += bht)
+        for (u32 tx = x & ~(bwd - 1); tx < x + w; tx += bwd) {
+            u32 X = tx & 2047, Y = ty & 2047, b;
+            switch (psm) {
+            case 0x02: b = a16(bp, bw, X, Y, gs_block16, 0) >> 7; break;
+            case 0x0A: b = a16(bp, bw, X, Y, gs_block16s, 0) >> 7; break;
+            case 0x13: b = a8(bp, bw, X, Y) >> 8; break;
+            case 0x14: b = a4(bp, bw, X, Y) >> 9; break;
+            default: b = a32(bp, bw, X, Y) >> 6; break;
+            }
+            fn(b & 0x3FFF, arg);
+        }
+}
+static void blk_bump(u32 b, void *a) { (void)a; blk_gen[b]++; }
+typedef struct {
+    u32 bp, bw, w, h, hash, nblk, complete;
+    u16 *blk; u32 *gen;                /* its blocks and their generations after it */
+    u32 pg0, pg1, *pgen;               /* its pages and their draw generations */
+    u8 *px; u32 cap;                   /* the pixels, w * h bytes */
+} urec_t;
+#define UREC_N 256
+static urec_t urec[UREC_N];
+static int urec_head, urec_cur = -1;   /* the next slot; the upload being received */
+static int16_t urec_at[0x4000];        /* block -> the record that starts there, + 1 */
+static void urec_collect(u32 b, void *a)
+{
+    urec_t *r = a;
+    if (r->nblk < 4096) { r->blk[r->nblk] = (u16)b; r->nblk++; }
+}
+/* an upload starts (TRXDIR 0) or a local copy is made (TRXDIR 2): its blocks change */
+static void urec_transfer(u32 dir)
+{
+    u32 dbp = BITS(bitbltbuf, 32, 14), dbw = BITS(bitbltbuf, 48, 6), dpsm = BITS(bitbltbuf, 56, 6);
+    u32 dx = BITS(trxpos, 32, 11), dy = BITS(trxpos, 48, 11), w = BITS(trxreg, 0, 12), h = BITS(trxreg, 32, 12);
+    rect_blocks(dpsm, dbp, dbw, dx, dy, w, h, blk_bump, 0);
+    urec_cur = -1;
+    if (ntex_on < 0) { const char *e = getenv("UYA_NTEX"); ntex_on = !e || atoi(e) != 0; e = getenv("UYA_NTEXCHECK"); ntex_check = e && atoi(e); }
+    if (!ntex_on || dir != 0 || dpsm != 0x13 || dx || dy || !w || !h || w > 1024 || h > 1024 || !dbw) return;
+    urec_t *r = &urec[urec_head];
+    if (r->bp < 0x4000 && urec_at[r->bp] == urec_head + 1) urec_at[r->bp] = 0;
+    urec_cur = urec_head; urec_head = (urec_head + 1) % UREC_N;
+    if (!r->blk) { r->blk = malloc(4096 * 2); r->gen = malloc(4096 * 4); r->pgen = malloc(512 * 4); }
+    if (r->cap < w * h) { free(r->px); r->px = malloc(w * h); r->cap = w * h; }
+    r->bp = dbp; r->bw = dbw; r->w = w; r->h = h; r->hash = 2166136261u; r->complete = 0; r->nblk = 0;
+    rect_blocks(0x13, dbp, dbw, 0, 0, w, h, urec_collect, r);
+    for (u32 i = 0; i < r->nblk; i++) r->gen[i] = blk_gen[r->blk[i]];
+    r->pg0 = 511; r->pg1 = 0;
+    for (u32 i = 0; i < r->nblk; i++) { u32 pg = r->blk[i] / 32; if (pg < r->pg0) r->pg0 = pg; if (pg > r->pg1) r->pg1 = pg; }
+    for (u32 pg = r->pg0; pg <= r->pg1; pg++) r->pgen[pg - r->pg0] = pg_draw_gen[pg];
+    if (dbp < up_lo || dbp + r->nblk > up_hi) {
+        if (dbp < up_lo) up_lo = dbp;
+        if (r->pg1 * 32 + 32 > up_hi) up_hi = r->pg1 * 32 + 32;
+        up_win_ver++;
+    }
+    urec_at[dbp] = (int16_t)(urec_cur + 1);
+}
+/* the upload's pixels as they arrive (PSMT8: a byte each, in order) */
+static inline void urec_data(u32 x, u32 y, const u8 *d, u32 n)
+{
+    urec_t *r = &urec[urec_cur];
+    memcpy(r->px + y * r->w + x, d, n);
+    u32 hsh = r->hash;
+    for (u32 i = 0; i < n; i++) hsh = (hsh ^ d[i]) * 16777619u;
+    r->hash = hsh;
+    if (y == r->h - 1 && x + n == r->w) r->complete = 1;
+}
+/* the kept upload a PSMT8 texture level is exactly, if it is still what memory holds */
+static const urec_t *urec_find(u32 tbp, u32 tbw, u32 tw, u32 th)
+{
+    if (ntex_on <= 0 || tbp >= 0x4000) return 0;
+    int i = urec_at[tbp] - 1;
+    if (i < 0) return 0;
+    const urec_t *r = &urec[i];
+    if (!r->complete || r->bp != tbp || r->bw != tbw || r->w != tw || r->h != th) return 0;
+    for (u32 k = 0; k < r->nblk; k++) if (blk_gen[r->blk[k]] != r->gen[k]) return 0;
+    for (u32 pg = r->pg0; pg <= r->pg1; pg++) if (pg_draw_gen[pg] != r->pgen[pg - r->pg0]) return 0;
+    return r;
+}
+/* a draw's target reaches the uploads' memory: those pages change (vertex_kick) */
+static void urec_drawn(u32 fbp, u32 fpsm, u32 fbw, u32 zbp, u32 zpsm, int z, u32 h)
+{
+    u32 n = (((fbw ? fbw : 1) * 64 * h * (fpsm == 0x02 || fpsm == 0x0A ? 16 : 32) / 8) + 255) / 256;
+    for (u32 pg = fbp / 32; pg <= (fbp + n) / 32 && pg < 512; pg++) if (pg * 32 + 32 > up_lo && pg * 32 < up_hi) pg_draw_gen[pg]++;
+    if (z) {
+        n = (((fbw ? fbw : 1) * 64 * h * ((zpsm & 0xF) == 2 || (zpsm & 0xF) == 0xA ? 16 : 32) / 8) + 255) / 256;
+        for (u32 pg = zbp / 32; pg <= (zbp + n) / 32 && pg < 512; pg++) if (pg * 32 + 32 > up_lo && pg * 32 < up_hi) pg_draw_gen[pg]++;
+    }
+}
+
 /* Content of GS memory by page, for the texture cache: games stream textures
  * through the same memory every frame (Kerwan: ~370 rebuilds a vsync), so an
  * entry whose pages were written again is still good if the bytes are the
@@ -337,12 +461,24 @@ static u32 area_blocks(u32 psm, u32 bw, u32 h)
     u32 w = (bw ? bw : 1) * 64;
     return (w * h * bits / 8 + 255) / 256 + 64;
 }
-typedef struct { u64 k1, k2, ch; u32 epoch, sum, p0, p1, w, h, used, ser; u32 *px; } tcache_t;
+typedef struct { u64 k1, k2, ch; u32 epoch, sum, p0, p1, w, h, used, ser; u32 *px; u32 up; } tcache_t;   /* up: decoded from an upload (ch is its content) */
 #define TC_BUDGET ((size_t)256 << 20)   /* bytes of decoded textures kept */
 static size_t tc_bytes;
 static tcache_t tc[TC_N];
 static u32 tc_clock, prim_serial;
 static struct { u32 serial; const tcache_t *e; } tc_memo[8];
+static unsigned long long n_tc_ntex, n_tc_uplook, n_tc_memlook, ntex_why[10];   /* textures decoded from the game's uploads; lookups by upload, by GS memory */
+/* a PSMT8 texture level from the game's upload of it (the pixels in order), as decode_tex would */
+static void urec_decode(u32 *out, u64 t0, const urec_t *r)
+{
+    u32 cpsm = BITS(t0, 51, 4);
+    u8 ta0 = (u8)BITS(texa, 0, 8), ta1 = (u8)BITS(texa, 32, 8);
+    int aem = (int)BITS(texa, 15, 1);
+    u32 pal[256];
+    for (u32 i = 0; i < 256; i++) { u32 v = clut[i]; pal[i] = rgba_u32(cpsm == 0 ? c32(v) : c16(v, aem, ta0, ta1)); }
+    const u8 *px = r->px;
+    for (u32 i = 0, n = r->w * r->h; i < n; i++) out[i] = pal[px[i]];
+}
 /* a whole texture level to RGBA, a swizzle block at a time */
 static void decode_tex(u32 *out, u64 t0, u32 tbp, u32 tbw, u32 tw, u32 th)
 {
@@ -491,7 +627,31 @@ static const tcache_t *tc_get(const gs_ctx_t *c, int lvl)
     if (p1 > 511) p1 = 511;
     u32 sum = 0; int have_sum = 0;
     u64 ch = 0; int have_ch = 0;
-    if (last[lvl] && last[lvl]->px && last[lvl]->used && last[lvl]->k1 == k1 && last[lvl]->k2 == k2 && last[lvl]->epoch == dirty_epoch) e = last[lvl];
+    /* a texture that is exactly one of the game's uploads (PSMT8, still intact): found by
+     * the upload's content, decoded from it, without GS memory (urec_t, above) */
+    const urec_t *rec = (psm == 0x13) ? urec_find(tbp, tbw, tw, th) : 0;
+    if (rec) n_tc_uplook++; else n_tc_memlook++;
+    {   /* testing: UYA_NTEXWHY=1: why lookups go to GS memory (logged with UYA_FPSLOG) */
+        static int why = -1; if (why < 0) why = getenv("UYA_NTEXWHY") != 0;
+        if (why && !rec) {
+            int k;
+            if (psm != 0x13) k = psm == 0x00 ? 1 : psm == 0x14 ? 2 : 3;
+            else if (tbp == 0) k = 4;
+            else if (urec_at[tbp] == 0) k = lvl ? 5 : 6;
+            else { const urec_t *r = &urec[urec_at[tbp] - 1]; k = (r->w != tw || r->h != th || r->bw != tbw) ? 7 : !r->complete ? 8 : 9; }
+            ntex_why[k]++;
+        }
+    }
+    u64 rch = rec ? ((u64)rec->hash << 24 | (u64)tw << 12 | th) : 0;
+    if (rec) {
+        if (last[lvl] && last[lvl]->px && last[lvl]->used && last[lvl]->k1 == k1 && last[lvl]->k2 == k2 && last[lvl]->up && last[lvl]->ch == rch) e = last[lvl];
+        for (u32 k = 0; k < 16 && !e; k++) {
+            int j = hidx[(hh + k) & 8191] - 1;
+            if (j >= 0 && tc[j].px && tc[j].used && tc[j].up && tc[j].k1 == k1 && tc[j].k2 == k2 && tc[j].ch == rch) e = &tc[j];
+        }
+        if (e) n_tc_reuse++;
+    }
+    else if (last[lvl] && last[lvl]->px && last[lvl]->used && last[lvl]->k1 == k1 && last[lvl]->k2 == k2 && last[lvl]->epoch == dirty_epoch && !last[lvl]->up) e = last[lvl];
     else {
         /* the entries of these keys (several, one per content the memory held): the
          * one whose pages did not change, else one with the same bytes there now */
@@ -500,6 +660,7 @@ static const tcache_t *tc_get(const gs_ctx_t *c, int lvl)
             int j = hidx[(hh + k) & 8191] - 1;
             if (j < 0 || !tc[j].px || !tc[j].used || tc[j].k1 != k1 || tc[j].k2 != k2) continue;
             tcache_t *x = &tc[j];
+            if (x->up) continue;                /* (an entry decoded from an upload: found by the upload only) */
             if (x->epoch == dirty_epoch) { e = x; break; }
             if (!have_sum) { for (u32 p = p0; p <= p1; p++) sum += page_gen[p]; have_sum = 1; }
             if (x->sum == sum) { x->epoch = dirty_epoch; e = x; break; }
@@ -517,7 +678,7 @@ static const tcache_t *tc_get(const gs_ctx_t *c, int lvl)
         /* the texture's memory must hold what the queued draws put there; the
          * entry's old pixels may still be in use by queued draws, so they are
          * retired (freed once the workers are past them), not overwritten */
-        if (dbg_drain_all & 1 || range_drawn(p0 * 32, (p1 - p0 + 1) * 32)) gs_drain();
+        if (!rec && (dbg_drain_all & 1 || range_drawn(p0 * 32, (p1 - p0 + 1) * 32))) gs_drain();
         else if (dbg_drain_all & 8) dbg_race(p0, p1, "texture", tbp);
         n_tc_build++;
         if (trxlog_on()) uya_log("tex build lvl %d TBP %04X TBW %u PSM %X %ux%u k2 %llX pages %u-%u", lvl, tbp, tbw, psm, tw, th, (unsigned long long)k2, p0, p1);
@@ -553,9 +714,24 @@ static const tcache_t *tc_get(const gs_ctx_t *c, int lvl)
         }
         e->k1 = k1; e->k2 = k2; e->w = tw; e->h = th; e->p0 = p0; e->p1 = p1;
         { static u32 ser_n; e->ser = ++ser_n; }
-        if (gsgl_on) gsgl_tex_read(psm, tbp, tbw, tw, th);   /* GS memory a GPU target drew */
         unsigned long long t_ = rdtsc_();
-        decode_tex(e->px, t0, tbp, tbw, tw, th);
+        if (rec) {
+            urec_decode(e->px, t0, rec);
+            if (ntex_check > 0) {   /* testing: the same as from GS memory? */
+                static u32 *tmp; static size_t tmpn; static unsigned long long nchk, nbad;
+                if (tmpn < (size_t)tw * th) { free(tmp); tmp = malloc((size_t)tw * th * 4); tmpn = (size_t)tw * th; }
+                if (!(gsgl_on && gsgl_tex_owned(psm, tbp, tbw, tw, th))) {
+                    if (range_drawn(p0 * 32, (p1 - p0 + 1) * 32)) gs_drain();
+                    decode_tex(tmp, t0, tbp, tbw, tw, th);
+                    nchk++;
+                    if (memcmp(tmp, e->px, (size_t)tw * th * 4)) { if (nbad++ < 20) uya_log("NTEXCHECK: texture %04X %ux%u from its upload differs from GS memory", tbp, tw, th); }
+                    if ((nchk & 4095) == 0) uya_log("NTEXCHECK: %llu textures from uploads checked, %llu differ", nchk, nbad);
+                }
+            }
+        } else {
+            if (gsgl_on) gsgl_tex_read(psm, tbp, tbw, tw, th);   /* GS memory a GPU target drew */
+            decode_tex(e->px, t0, tbp, tbw, tw, th);
+        }
         {   /* testing: UYA_TEXDUMP=tbp saves that texture (RGBA, alpha as a second image) when decoded */
             static int want = -2; static int nd;
             if (want == -2) { const char *x = getenv("UYA_TEXDUMP"); want = x ? (int)strtol(x, 0, 16) : -1; }
@@ -570,10 +746,14 @@ static const tcache_t *tc_get(const gs_ctx_t *c, int lvl)
             }
         }
         t_tcb += rdtsc_() - t_;
-        sum = 0;
-        for (u32 p = p0; p <= p1; p++) sum += page_gen[p];
-        e->sum = sum; e->epoch = dirty_epoch;
-        e->ch = (gsgl_on && gsgl_tex_owned(psm, tbp, tbw, tw, th)) ? 0 : pages_content(p0, p1);   /* (never a hash of pages a target owns) */
+        e->up = rec != 0;
+        if (rec) { e->sum = ~0u; e->epoch = 0; e->ch = rch; n_tc_ntex++; }
+        else {
+            sum = 0;
+            for (u32 p = p0; p <= p1; p++) sum += page_gen[p];
+            e->sum = sum; e->epoch = dirty_epoch;
+            e->ch = (gsgl_on && gsgl_tex_owned(psm, tbp, tbw, tw, th)) ? 0 : pages_content(p0, p1);   /* (never a hash of pages a target owns) */
+        }
     }
     e->used = ++tc_clock;
     last[lvl] = e;
@@ -1491,6 +1671,109 @@ static int cmd_setup(pcmd_t *p)
     return 1;
 }
 
+
+/* ---- testing: UYA_MEMSURVEY=n (with UYA_MTGS=0) ----
+ * How the game uses GS memory, for a renderer without it: every 256-byte block
+ * remembers what last wrote it (an upload from the EE and its format, a local
+ * copy, a draw into a frame or Z buffer); every texture and palette a draw
+ * reads is classed by that. Logged every n vsyncs (counts since the last log,
+ * and since the start). */
+enum { SV_NONE, SV_UP, SV_COPY, SV_DRAW, SV_ZDRAW };
+static u8 sv_kind[0x4000], sv_psm[0x4000]; static u16 sv_by[0x4000];   /* the frame buffer (FBP) that drew a block, or the upload's DBW<<8|...  */
+static int sv_on = -1;
+static int survey_on(void) { if (sv_on < 0) { const char *e = getenv("UYA_MEMSURVEY"); sv_on = e ? atoi(e) : 0; } return sv_on > 0; }
+static u32 sv_blocks(u32 psm, u32 bw, u32 h)
+{
+    u32 bits = psm_bits(psm); if (bits == 24) bits = 32;
+    return ((bw ? bw : 1) * 64 * h * bits / 8 + 255) / 256;
+}
+static u16 sv_cur_by;
+static void sv_mark(u32 bp, u32 n, u8 kind, u8 psm) { for (u32 i = 0; i < n && bp + i < 0x4000; i++) { sv_kind[bp + i] = kind; sv_psm[bp + i] = psm; sv_by[bp + i] = sv_cur_by; } }
+#define SV_T 4096
+static struct { u64 key; u32 cls, n, last, by, nper; } sv_tex[SV_T];
+static unsigned long long sv_cls_n[8], sv_cls_u[8], sv_cls_n_all[8], sv_cls_u_all[8], sv_clut[8], sv_clut_all[8];
+static u32 sv_pairs[64][64], sv_epoch;
+static const char *sv_name[8] = { "never written", "uploaded, same format", "uploaded as another format", "rendered (render to texture)", "local copy", "mixed", "rendered Z", "" };
+/* the class of a range of blocks read as format psm */
+static int sv_class(u32 bp, u32 n, u32 psm, int note)
+{
+    int c = -1;
+    for (u32 i = 0; i < n && bp + i < 0x4000; i++) {
+        int k = sv_kind[bp + i], cc;
+        if (k == SV_NONE) cc = 0;
+        else if (k == SV_UP) { cc = sv_psm[bp + i] == psm ? 1 : 2; if (cc == 2 && note) sv_pairs[sv_psm[bp + i] & 63][psm & 63]++; }
+        else if (k == SV_DRAW) cc = 3;
+        else if (k == SV_ZDRAW) cc = 6;
+        else cc = 4;
+        if (c < 0) c = cc; else if (c != cc) c = 5;
+    }
+    return c < 0 ? 0 : c;
+}
+static void survey_state(const pcmd_t *p)
+{
+    sv_cur_by = (u16)(p->fbp / 32);
+    if (p->fbw) sv_mark(p->fbp, sv_blocks(p->fpsm, p->fbw, (u32)p->sy1 + 1), SV_DRAW, (u8)p->fpsm);
+    if (p->zte && !p->zmsk && p->fbw) sv_mark(p->zbp, sv_blocks(p->zpsm, p->fbw, (u32)p->sy1 + 1), SV_ZDRAW, (u8)p->zpsm);
+    if (!p->tme) return;
+    u64 t0 = p->tex0;
+    u32 tbp = BITS(t0, 0, 14), tbw = BITS(t0, 14, 6), psm = BITS(t0, 20, 6), tw = 1u << BITS(t0, 26, 4), th = 1u << BITS(t0, 30, 4);
+    u32 cbp = BITS(t0, 37, 14);
+    /* the levels the draw can read: level 0 unless the LOD settings never pick it (a fixed
+     * LOD past 0: LCM 1 with K >= 1), and levels 1..MXL from MIPTBP1/2 when mipmapping */
+    int cls = -1, lmin = 0;
+    if (p->mmin >= 2 && p->mxl > 0 && p->lcm == 1 && p->k >= 1.0f) lmin = 1;
+    int lmax = (p->mmin >= 2) ? p->mxl : 0;
+    for (int l = lmin; l <= lmax; l++) {
+        u32 bp_, bw_;
+        if (l == 0) { bp_ = tbp; bw_ = tbw; }
+        else if (l <= 3) { u64 m = p->miptbp1; bp_ = BITS(m, (l - 1) * 20, 14); bw_ = BITS(m, (l - 1) * 20 + 14, 6); }
+        else { u64 m = p->miptbp2; bp_ = BITS(m, (l - 4) * 20, 14); bw_ = BITS(m, (l - 4) * 20 + 14, 6); }
+        u32 lw = tw >> l, lh = th >> l; if (!lw) lw = 1; if (!lh) lh = 1;
+        int c1 = sv_class(bp_, sv_blocks(psm, bw_ ? bw_ : (lw + 63) / 64, lh), psm, 1);
+        cls = cls < 0 ? c1 : (cls == c1 ? cls : 5);
+    }
+    if (cls < 0) cls = 0;
+    u64 key = (u64)tbp | ((u64)psm << 14) | ((u64)tbw << 20) | ((u64)BITS(t0, 26, 8) << 26) | ((u64)cbp << 34);
+    u32 h = (u32)((key * 0x9E3779B97F4A7C15ull) >> 52) & (SV_T - 1);
+    for (int k = 0; k < 16; k++) {
+        u32 j = (h + k) & (SV_T - 1);
+        if (!sv_tex[j].n || sv_tex[j].key == key) {
+            if (!sv_tex[j].n) { sv_tex[j].key = key; sv_cls_u_all[cls]++; }
+            if (sv_tex[j].last != sv_epoch + 1) { sv_tex[j].last = sv_epoch + 1; sv_cls_u[cls]++; }
+            sv_tex[j].n++; sv_tex[j].nper++; sv_tex[j].cls = cls; sv_tex[j].by = sv_kind[tbp] == SV_DRAW ? sv_by[tbp] : 0xFFFF; break;
+        }
+    }
+    sv_cls_n[cls]++; sv_cls_n_all[cls]++;
+}
+static void survey_clut(u64 t0)
+{
+    u32 cbp = BITS(t0, 37, 14), cpsm = BITS(t0, 51, 4), psm = BITS(t0, 20, 6);
+    u32 n = (psm == 0x13 || psm == 0x1B) ? 4 : 1;
+    int cls = sv_class(cbp, n, cpsm == 0 ? 0x00 : cpsm, 0);
+    sv_clut[cls]++; sv_clut_all[cls]++;
+}
+static void survey_report(void)
+{
+    static u32 vs;
+    if (++vs % (u32)sv_on) return;
+    uya_log("memory survey at vsync %u: texture reads by what last wrote the texture's blocks (draw states / distinct textures, last %d vsyncs | since the start)", uya_frame_count(), sv_on);
+    for (int c = 0; c < 7; c++) if (sv_cls_n_all[c] || sv_clut_all[c])
+        uya_log("  %-30s textures %7llu / %5llu | %8llu / %5llu   palettes %6llu | %7llu", sv_name[c], sv_cls_n[c], sv_cls_u[c], sv_cls_n_all[c], sv_cls_u_all[c], sv_clut[c], sv_clut_all[c]);
+    for (int a = 0; a < 64; a++) for (int b = 0; b < 64; b++) if (sv_pairs[a][b]) uya_log("  uploaded as format %02X, read as %02X: %u draw states", a, b, sv_pairs[a][b]);
+    for (int pass = 0; pass < 16; pass++) {   /* the most drawn textures that are not plain uploads */
+        int b = -1;
+        for (int j = 0; j < SV_T; j++) if (sv_tex[j].nper && sv_tex[j].cls != 1 && (b < 0 || sv_tex[j].nper > sv_tex[b].nper)) b = j;
+        if (b < 0) break;
+        u64 k = sv_tex[b].key;
+        uya_log("    TBP %04X PSM %02X TBW %u size %ux%u CBP %04X: %u draw states, %s%s", (u32)(k & 0x3FFF), (u32)((k >> 14) & 63), (u32)((k >> 20) & 63),
+                1u << ((k >> 26) & 15), 1u << ((k >> 30) & 15), (u32)((k >> 34) & 0x3FFF), sv_tex[b].nper, sv_name[sv_tex[b].cls],
+                sv_tex[b].by != 0xFFFF ? " (drawn as frame buffer page" : "");
+        if (sv_tex[b].by != 0xFFFF) uya_log("      ... FBP page %u)", sv_tex[b].by);
+        sv_tex[b].nper = 0;
+    }
+    for (int j = 0; j < SV_T; j++) sv_tex[j].nper = 0;
+    memset(sv_cls_n, 0, sizeof sv_cls_n); memset(sv_cls_u, 0, sizeof sv_cls_u); memset(sv_clut, 0, sizeof sv_clut); sv_epoch++;
+}
 /* memcmp of two commands (cmd_setup zeroes the padding), a word at a time */
 static inline int cmd_same(const pcmd_t *a, const pcmd_t *b)
 {
@@ -1498,6 +1781,18 @@ static inline int cmd_same(const pcmd_t *a, const pcmd_t *b)
     u32 d = 0;
     for (u32 i = 0; i < sizeof *a / 4; i++) d |= x[i] ^ y[i];
     return d == 0;
+}
+/* (the native texture path: a draw into memory uploads were kept for) */
+static void urec_hits(u32 sti)
+{
+    static u32 chk_st = ~0u, chk_ver = ~0u; static int hits;
+    if (sti != chk_st || up_win_ver != chk_ver) {
+        const pcmd_t *S = &sring[sti % SN];
+        u32 fn = (((S->fbw ? S->fbw : 1) * 64 * (u32)(S->sy1 + 1) * 4) + 255) / 256;
+        hits = S->fbw && ((S->fbp < up_hi && S->fbp + fn > up_lo) || (S->zte && !S->zmsk && S->zbp < up_hi && S->zbp + fn > up_lo));
+        chk_st = sti; chk_ver = up_win_ver;
+    }
+    if (hits) { const pcmd_t *S = &sring[sti % SN]; urec_drawn(S->fbp, S->fpsm, S->fbw, S->zbp, S->zpsm, S->zte && !S->zmsk, (u32)S->sy1 + 1); }
 }
 static int st_dirty = 1, st_tme;
 static u32 st_epoch;
@@ -1531,10 +1826,12 @@ static void vertex_kick(u32 X, u32 Y, u32 Z, u8 F, int draw)
         if (st_dirty || (st_tme && st_epoch != dirty_epoch)) {
             pcmd_t ns;
             cmd_setup(&ns);
+            if (__builtin_expect(sv_on > 0, 0)) survey_state(&ns);
             if (!s_head || !cmd_same(&ns, &sring[(s_head - 1) % SN])) { sring[s_head % SN] = ns; s_head++; }
             st_dirty = 0; st_tme = ns.tme; st_epoch = dirty_epoch;
         }
         pc.st = s_head - 1;
+        urec_hits(pc.st);
         {
             static int left = -1;
             if (left < 0) { const char *e = getenv("UYA_SPRLOG"); left = e ? atoi(e) : 0; }
@@ -1552,7 +1849,7 @@ static void vertex_kick(u32 X, u32 Y, u32 Z, u8 F, int draw)
             if (left > 0 && uya_frame_count() >= from && (!fst_only || BITS(pr, 8, 1))) {
                 const pcmd_t *S = &sring[pc.st % SN];
                 left--;
-                uya_log("prim %u (%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f) rgba %u,%u,%u,%u uv %.1f,%.1f TME %u FST %u TEX0 %016llX ABE %u ATE %u/%u/%u ZTE %u/%u FRAME %llX ALPHA %llX TEXA %llX", kind[type],
+                uya_log("prim [%s] %u (%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f) rgba %u,%u,%u,%u uv %.1f,%.1f TME %u FST %u TEX0 %016llX ABE %u ATE %u/%u/%u ZTE %u/%u FRAME %llX ALPHA %llX TEXA %llX", gs_src_int, kind[type],
                         vq[0].x, vq[0].y, vq[1].x, vq[1].y, vq[2].x, vq[2].y, vq[0].r, vq[0].g, vq[0].b, vq[0].a, vq[0].u, vq[0].v,
                         S->tme, S->fst, (unsigned long long)ctx[BITS(pr, 9, 1)].tex0, S->abe, S->ate, S->atst, S->aref, S->zte, S->ztst, (unsigned long long)ctx[BITS(pr, 9, 1)].frame,
                         (unsigned long long)ctx[BITS(pr, 9, 1)].alpha, (unsigned long long)texa);
@@ -1651,6 +1948,12 @@ static void trx_start(u32 dir)
         if (dir == 2) gsgl_cpu_read_rect(BITS(bitbltbuf, 24, 6), BITS(bitbltbuf, 0, 14), BITS(bitbltbuf, 16, 6), BITS(trxpos, 0, 11), BITS(trxpos, 16, 11), w, h);
         gsgl_cpu_write_rect(BITS(bitbltbuf, 56, 6), BITS(bitbltbuf, 32, 14), BITS(bitbltbuf, 48, 6), BITS(trxpos, 32, 11), BITS(trxpos, 48, 11), w, h);
     }
+    if (survey_on() && (dir == 0 || dir == 2)) {
+        u32 dbp_ = BITS(bitbltbuf, 32, 14), dbw_ = BITS(bitbltbuf, 48, 6), dpsm_ = BITS(bitbltbuf, 56, 6);
+        sv_cur_by = 0xFFFF;
+        sv_mark(dbp_, sv_blocks(dpsm_, dbw_, BITS(trxpos, 48, 11) + BITS(trxreg, 32, 12)), dir == 0 ? SV_UP : SV_COPY, (u8)dpsm_);
+    }
+    if (dir == 0 || dir == 2) urec_transfer(dir);
     trx_active = 0;
     if (trx_pend) { mark_blocks(trx_rbp, trx_rn); trx_pend = 0; }   /* an unfinished upload */
     if (dir == 0 || dir == 2) {
@@ -1718,6 +2021,7 @@ static void trx_data_(const u8 *d, u32 bytes)
                     for (u32 j = 0; j < n; j++) { u32 v = d[i + k + j]; vram8()[base + col[(X & 15) + j]] = (u8)v; hsh = (hsh ^ v) * 16777619u; }
                     k += n;
                 }
+                if (urec_cur >= 0) urec_data(trx_x, trx_y, d + i, run);
                 i += run;
             } else if (dpsm == 0x00) {
                 const u8 *col = gs_col32[y & 7];
@@ -1877,6 +2181,7 @@ static volatile int rec_hotkey;
 /* F9 (platform_win32.c): record the next UYA_GSREC_N vsyncs (default 150) to gsrec_NN.bin next to the exe */
 void uya_gs_rec_hotkey(void) { rec_hotkey = 1; }
 static void rec_put(const void *p, size_t n) { if (rec_f) fwrite(p, 1, n, rec_f); }
+static void rec_meshes(void);
 static void rec_vsync(const u64 *r)
 {
     if (rec_from == -1) {
@@ -1902,6 +2207,7 @@ static void rec_vsync(const u64 *r)
         GS_SNAP_FIELDS(X)
 #undef X
         rec_put(vram, 4 << 20);
+        rec_meshes();   /* (the native meshes alive: as native draw lists that make them again) */
     } else if (rec_vs > rec_from) {
         u32 k = 2; rec_put(&k, 4); rec_put(r, 48);
         if (rec_vs >= rec_to) { fclose(rec_f); rec_f = 0; uya_log("GS input recorded"); }
@@ -1914,6 +2220,7 @@ static void rec_gif(const u32 *d, u32 qwc, u32 path)
     u32 h[3] = { 1, path, qwc }; rec_put(h, 12); rec_put(d, qwc * 16);
 }
 static void uya_gs_gif_(const u32 *d, u32 qwc);
+static void gs_dlist_(const u32 *d, u32 qwc);
 /* ---- the GS thread ----
  * With UYA_MTGS (on by default with 3 or more cores) GIF data is copied into
  * a FIFO and the GS (register writes, primitives, transfers, the texture
@@ -1952,6 +2259,12 @@ static void gs_thread_loop(void)
             if (path == 0xFFFFFFFEu) { gs_vsync_marker(e + 4); t += 4 + qwc * 4; continue; }   /* a vsync: capture the frame */
             if (path == 0xFFFFFFFCu) { gs_movie_marker(e + 4); t += 4 + qwc * 4; continue; }   /* an FMV frame to show */
             if (path == 0xFFFFFFFDu) { gl_mem_do(e + 4); t += 4 + qwc * 4; continue; }         /* GL: the game's thread touches GS memory */
+            if (path == 3) {                                                            /* a native draw list */
+                gs_src_int = "native";
+                if (__builtin_expect(rec_f != 0, 0)) rec_gif(e + 4, qwc, 3);
+                gs_dlist_(e + 4, qwc);
+                t += 4 + qwc * 4; continue;
+            }
             gs_src_int = path_name[path];
             if (__builtin_expect(rec_f != 0, 0)) rec_gif(e + 4, qwc, path);
             uya_gs_gif_(e + 4, qwc);
@@ -2075,6 +2388,188 @@ void uya_gs_gif(const u32 *d, u32 qwc)
     else gs_fifo_put(d, qwc, (uya_gs_src[0] == 'P' && uya_gs_src[4] >= '1' && uya_gs_src[4] <= '3') ? (u32)(uya_gs_src[4] - '1') : 2);
     if (uya_timing) uya_t_gs += rdtsc_() - t;
 }
+/* ---- native draw lists ----
+ * The native renderers (host/src/native) hand their draws over as a list of
+ * commands rather than as GIF packets (host/src/native/native_dlist.c builds
+ * it), one qword each:
+ *   {1, addr, lo, hi}    a register write
+ *   {2, n, 0, 0}         a strip: n vertices follow, two qwords each:
+ *                        {x | y << 16, z, r | g << 8 | b << 16 | a << 24, f | adc << 8 | xyz2 << 9}
+ *                        {s, t, q, 0} (the bits of the floats)
+ *   {3, 0, 0, 0}         a new primitive run (Q back to 1, as at a GIF tag)
+ * Each vertex sets ST and Q, RGBA (the Q of RGBAQ 0) and kicks, as the GIF's
+ * PACKED ST, RGBAQ and XYZF2 (or XYZ2) qwords do: the same primitives. */
+/* ---- native meshes (the GS side): kept for the GPU renderer (gsgl_mesh_*), and here too, to
+ * draw them in software (the same transform on the CPU, then the same primitives) ---- */
+#define GSMESH_N 32768
+static struct { int gl; float *v6; u8 *rgba; u32 *idx; u32 nv, ni; } gsmesh[GSMESH_N];
+static void gs_mesh_free(u32 id)
+{
+    if (id >= GSMESH_N) return;
+    if (gsgl_on && gsmesh[id].gl >= 0 && gsmesh[id].v6) gsgl_mesh_free(gsmesh[id].gl);
+    free(gsmesh[id].v6); free(gsmesh[id].rgba); free(gsmesh[id].idx);
+    memset(&gsmesh[id], 0, sizeof gsmesh[id]); gsmesh[id].gl = -1;
+}
+static void gs_mesh_create(u32 id, const float *v6, const u8 *rgba, u32 nv, const u32 *idx, u32 ni)
+{
+    if (id >= GSMESH_N) return;
+    gs_mesh_free(id);
+    gsmesh[id].v6 = malloc((size_t)nv * 24); memcpy(gsmesh[id].v6, v6, (size_t)nv * 24);
+    gsmesh[id].rgba = malloc((size_t)nv * 4); memcpy(gsmesh[id].rgba, rgba, (size_t)nv * 4);
+    gsmesh[id].idx = malloc((size_t)ni * 4); memcpy(gsmesh[id].idx, idx, (size_t)ni * 4);
+    gsmesh[id].nv = nv; gsmesh[id].ni = ni;
+    gsmesh[id].gl = gsgl_on ? gsgl_mesh_create(v6, rgba, (int)nv, idx, (int)ni) : -1;
+}
+/* new colours (and, v6 not 0, new vertices) for a mesh */
+static void gs_mesh_update(u32 id, const float *v6, const u8 *rgba, u32 nv)
+{
+    if (id >= GSMESH_N || !gsmesh[id].v6 || nv != gsmesh[id].nv) return;
+    memcpy(gsmesh[id].rgba, rgba, (size_t)nv * 4);
+    if (v6) memcpy(gsmesh[id].v6, v6, (size_t)nv * 24);
+    if (gsgl_on && gsmesh[id].gl >= 0) gsgl_mesh_update(gsmesh[id].gl, v6, rgba);
+}
+static void rec_meshes(void)
+{
+    for (u32 id = 0; id < GSMESH_N; id++) {
+        if (!gsmesh[id].v6) continue;
+        u32 nvx = gsmesh[id].nv, ni = gsmesh[id].ni, q6 = (nvx * 6 + 3) / 4, qc = (nvx + 3) / 4, qi = (ni + 3) / 4, n = 1 + q6 + qc + qi;
+        u32 *b = calloc((size_t)n * 4, 4);
+        if (!b) return;
+        b[0] = 4; b[1] = id; b[2] = nvx; b[3] = ni;
+        memcpy(b + 4, gsmesh[id].v6, (size_t)nvx * 24);
+        memcpy(b + 4 + q6 * 4, gsmesh[id].rgba, (size_t)nvx * 4);
+        memcpy(b + 4 + (q6 + qc) * 4, gsmesh[id].idx, (size_t)ni * 4);
+        u32 h[3] = { 1, 3, n }; rec_put(h, 12); rec_put(b, (size_t)n * 16);
+        free(b);
+    }
+}
+/* the state for the next primitives (as vertex_kick makes it) */
+static u32 gs_cur_state(void)
+{
+    if (!sring) sring = calloc(SN, sizeof(pcmd_t));
+    if (st_dirty || (st_tme && st_epoch != dirty_epoch)) {
+        pcmd_t ns;
+        cmd_setup(&ns);
+        if (__builtin_expect(sv_on > 0, 0)) survey_state(&ns);
+        if (!s_head || !cmd_same(&ns, &sring[(s_head - 1) % SN])) { sring[s_head % SN] = ns; s_head++; }
+        st_dirty = 0; st_tme = ns.tme; st_epoch = dirty_epoch;
+    }
+    return s_head - 1;
+}
+/* one vertex of a mesh as the GS would have received it (the transform of nvs_src in gs_gl.c) */
+static void gs_mesh_vertex(const float *xf, const float *p6, const u8 *c, vtx_t *o, float *w_out)
+{
+    const float *m = xf;
+    float P[4];
+    for (int k = 0; k < 4; k++) { float a = m[12 + k] * p6[3]; a = a + m[k] * p6[0]; a = a + m[4 + k] * p6[1]; P[k] = a + m[8 + k] * p6[2]; }
+    float w = P[3], q = xf[16] / w;
+    float sx = P[0] * q + xf[20], sy = P[1] * q + xf[21], sz = P[2] * q + xf[22];
+    o->x = truncf(sx * 16.0f) / 16.0f - xf[24]; o->y = truncf(sy * 16.0f) / 16.0f - xf[25];
+    o->z = sz <= 0.0f ? 0u : (sz >= 4294967040.0f ? 0xFFFFFF00u : (u32)sz);
+    o->r = c[0]; o->g = c[1]; o->b = c[2]; o->a = c[3];
+    o->s = p6[4] * q; o->t = p6[5] * q; o->q = q; o->u = o->v = 0;
+    float f = w + xf[19]; if (f < xf[17]) f = xf[17]; if (f > xf[18]) f = xf[18];
+    o->f = (u8)(f < 0 ? 0 : f > 255 ? 255 : (u32)f);
+    *w_out = w / xf[16];                    /* (1/Q: the distance the near limit is in) */
+}
+static void gs_mesh_draw(u32 id, u32 first, u32 count, const float *xf)
+{
+    if (id >= GSMESH_N || !gsmesh[id].v6 || first + count > gsmesh[id].ni) return;
+    u32 sti = gs_cur_state();
+    const pcmd_t *S = &sring[sti % SN];
+    float xfl[32];   /* the caller's transform, with this GS's XYOFFSET and the texture's size */
+    memcpy(xfl, xf, sizeof xfl);
+    {
+        u64 pr = prmodecont ? prim : ((prim & 7) | (prmode & ~7ull));
+        const gs_ctx_t *c = &ctx[BITS(pr, 9, 1)];
+        xfl[24] = (float)BITS(c->xyoffset, 0, 16) / 16.0f; xfl[25] = (float)BITS(c->xyoffset, 32, 16) / 16.0f;
+        xfl[26] = S->tw; xfl[27] = S->th;
+    }
+    xf = xfl;
+    urec_hits(sti);
+    if (gsgl_on) {
+        if (gsmesh[id].gl >= 0) gsgl_mesh_draw(S, sti, gsmesh[id].gl, (int)first, (int)count, xf);
+        return;
+    }
+    const u32 *ix = gsmesh[id].idx + first;
+    for (u32 t = 0; t + 2 < count; t += 3) {
+        pprim_t pc; float w[3];
+        for (int k = 0; k < 3; k++) {
+            u32 j = ix[t + k];
+            if (j >= gsmesh[id].nv) return;
+            gs_mesh_vertex(xf, gsmesh[id].v6 + j * 6, gsmesh[id].rgba + j * 4, &pc.v[k], &w[k]);
+        }
+        if (w[0] < xf[23] || w[1] < xf[23] || w[2] < xf[23]) continue;   /* (behind the near limit: the GPU clips it) */
+        pc.st = sti; pc.type = 3; stat_prims++; gs_kicks_drawn++;
+        submit(&pc);
+    }
+}
+
+static void gs_dlist_(const u32 *d, u32 qwc)
+{
+    if (!vram) return;
+    u32 q = 0;
+    while (q < qwc) {
+        const u32 *c = d + q * 4;
+        switch (c[0]) {
+        case 1: uya_gs_write(c[1], ((u64)c[3] << 32) | c[2]); q++; break;
+        case 3: qreg = 1.0f; q++; break;
+        case 2: {
+            u32 n = c[1];
+            const u32 *v = c + 4;
+            for (u32 i = 0; i < n; i++, v += 8) {
+                st = ((u64)v[5] << 32) | v[4];
+                memcpy(&qreg, &v[6], 4);
+                rgbaq = v[2];
+                if (v[3] & 0x200) vertex_kick(v[0] & 0xFFFF, v[0] >> 16, v[1], 0, !((v[3] >> 8) & 1));
+                else vertex_kick(v[0] & 0xFFFF, v[0] >> 16, v[1], (u8)v[3], !((v[3] >> 8) & 1));
+            }
+            q += 1 + 2 * n;
+        } break;
+        case 4: {   /* a native mesh: {4, id, nv, ni} + nv * (x y z w s t) + nv rgba + ni indices (each part to a qword) */
+            u32 id = c[1], nvx = c[2], ni = c[3];
+            const u32 *v = c + 4;
+            u32 q6 = (nvx * 6 + 3) / 4, qc = (nvx + 3) / 4, qi = (ni + 3) / 4;
+            gs_mesh_create(id, (const float *)v, (const u8 *)(v + q6 * 4), nvx, v + (q6 + qc) * 4, ni);
+            q += 1 + q6 + qc + qi;
+        } break;
+        case 5: {   /* new colours for mesh id: {5, id, nv, 0} + nv rgba */
+            gs_mesh_update(c[1], 0, (const u8 *)(c + 4), c[2]);
+            q += 1 + (c[2] + 3) / 4;
+        } break;
+        case 8: {   /* new vertices and colours for mesh id: {8, id, nv, 0} + nv * (x y z w s t) + nv rgba */
+            u32 nvx = c[2], q6 = (nvx * 6 + 3) / 4;
+            gs_mesh_update(c[1], (const float *)(c + 4), (const u8 *)(c + 4 + q6 * 4), nvx);
+            q += 1 + q6 + (nvx + 3) / 4;
+        } break;
+        case 6: gs_mesh_free(c[1]); q++; break;
+        case 7: {   /* draw indices [first, first + count) of mesh id: {7, id, first, count} + 8 qwords of transform */
+            gs_mesh_draw(c[1], c[2], c[3], (const float *)(c + 4));
+            q += 9;
+        } break;
+        default: q = qwc; break;
+        }
+    }
+}
+int uya_gs_renderer_gl(void) { return gsgl_on; }   /* (the GPU renderer draws: native meshes are clipped there) */
+/* a native draw list from the game's thread: run here, or queued for the GS thread */
+void uya_gs_dlist(const u32 *d, u32 qwc)
+{
+    if (uya_srcstats_on() && !mtgs) {
+        if (src_dropped(uya_gs_src)) return;
+        unsigned long long t0 = rdtsc_(), k0 = gs_kicks_drawn;
+        gs_src_int = uya_gs_src; gs_dlist_(d, qwc);
+        unsigned long long dt = rdtsc_() - t0; gs_time_in += dt;
+        uya_srcstat_add(uya_gs_src, dt, qwc, gs_kicks_drawn - k0);
+        return;
+    }
+    unsigned long long t = timing() ? rdtsc_() : 0;
+    if (__builtin_expect(rec_f != 0, 0) && !mtgs) rec_gif(d, qwc, 3);
+    if (!mtgs) { gs_src_int = uya_gs_src; gs_dlist_(d, qwc); }
+    else gs_fifo_put(d, qwc, 3);
+    if (uya_timing) uya_t_gs += rdtsc_() - t;
+}
+
 static void uya_gs_gif_(const u32 *d, u32 qwc)
 {
     u32 q = 0;
@@ -2277,6 +2772,10 @@ static void fps_log(void)
             extern unsigned long long uya_tex_px;
             extern unsigned long long nsends; static unsigned long long s0;
             uya_log("   %llu DMA sends (frames) in 100 vsyncs; per vsync: %llu waits for the GS threads (%u for layouts), %llu textures decoded, %llu pixels uploaded", nsends - s0, n_drain_wait / 100, n_layout_drain / 100, n_tc_build / 100, n_trx_px / 100); s0 = nsends;
+            uya_log("   textures: %llu lookups by the game's uploads, %llu by GS memory; %llu decoded from uploads (per vsync)", n_tc_uplook / 100, n_tc_memlook / 100, n_tc_ntex / 100);
+            if (getenv("UYA_NTEXWHY")) { uya_log("   GS memory lookups: CT32 %llu, T4 %llu, other format %llu, T8 at TBP 0 %llu, T8 no upload there (mip level %llu, level 0 %llu), T8 upload of another size %llu, incomplete %llu, written over %llu",
+                ntex_why[1] / 100, ntex_why[2] / 100, ntex_why[3] / 100, ntex_why[4] / 100, ntex_why[5] / 100, ntex_why[6] / 100, ntex_why[7] / 100, ntex_why[8] / 100, ntex_why[9] / 100); memset(ntex_why, 0, sizeof ntex_why); }
+            n_tc_uplook = n_tc_memlook = n_tc_ntex = 0;
             uya_log("   texture rebuilds for stale data %llu, reused by content %llu; marks: uploads %llu, targets %llu", n_tc_stale / 100, n_tc_reuse / 100, n_mark_trx / 100, n_mark_draw / 100);
             n_tc_stale = n_tc_reuse = n_mark_trx = n_mark_draw = 0;
             uya_log("   time: drawing %.0f%%, texture decode %.0f%%, uploads %.0f%%", 100.0 * t_draw / (c1 - c0), 100.0 * t_tcb / (c1 - c0), 100.0 * t_trx / (c1 - c0));
@@ -2353,6 +2852,7 @@ int uya_gs_movie_frame(const u32 *px, int w, int h)
 void uya_gs_vsync(void)
 {
     if (!vram) return;
+    if (survey_on()) survey_report();
     if (uya_srcstats_on() && uya_frame_count() % srcstats == 0) srcstats_log();
     u64 r[6] = { *(volatile u64 *)0x12000000, *(volatile u64 *)0x12000020,
                  *(volatile u64 *)0x12000070, *(volatile u64 *)0x12000080, *(volatile u64 *)0x12000090, *(volatile u64 *)0x120000A0 };
